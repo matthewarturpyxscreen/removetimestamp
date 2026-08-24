@@ -1,1123 +1,557 @@
 # ============================================================
-# TIMESTAMP REMOVER V9.0 - GEMINI NATIVE IMAGE EDITING
+# TIMESTAMP REMOVER - STREAMLIT UI (BATCH + ZIP)
 # ============================================================
 #
-# Konsep V9:
+# Kebalikan dari "Timestamp Generator": app ini MENGHAPUS
+# watermark timestamp gaya GPS Map Camera (koordinat, lokasi,
+# tanggal & jam, teks putih dengan outline hitam di pojok kiri
+# bawah) dari foto.
 #
-#   Upload foto / ZIP
-#          ↓
-#   Gemini Image Editing
-#          ↓
-#   Gemini sendiri mendeteksi timestamp
-#   + menghapusnya
-#   + merekonstruksi background
-#          ↓
-#   Output dengan nama & struktur yang sama
+# CARA KERJA DETEKSI (tanpa AI/API key, murni image processing):
+#   1. Hanya melihat area PITA BAWAH foto (persentase tinggi
+#      bisa diatur), karena timestamp GPS Map Camera selalu di
+#      pojok kiri bawah.
+#   2. Di area itu, cari piksel PUTIH TERANG (isi teks) yang
+#      posisinya berdekatan dengan tepi kontras tinggi (outline
+#      hitam teks). Kombinasi "putih + nempel ke outline tajam"
+#      inilah yang membedakan teks dari area putih polos biasa
+#      (lantai keramik putih, tembok putih, baju putih, dll)
+#      yang TIDAK dekat dengan outline tajam serapat itu.
+#   3. Mask hasil deteksi di-dilate & di-inpaint (cv2.inpaint)
+#      supaya area bekas teks direkonstruksi otomatis mengikuti
+#      pola sekitarnya (lantai, tembok, dsb).
 #
-# TIDAK menggunakan:
-# - Gemini OCR / bounding box
-# - OpenCV pixel threshold
-# - rectangle mask
-# - manual text input
+# BATCH:
+#   - Bisa upload banyak foto sekaligus, ATAU upload 1 file .zip
+#     berisi banyak foto.
+#   - Semua foto diproses dengan parameter yang sama (bisa
+#     diatur di sidebar), lalu bisa didownload satu-satu atau
+#     sekaligus dalam .zip.
 #
-# Gemini dipakai sebagai IMAGE EDITOR langsung,
-# seperti workflow edit gambar di Gemini.
-#
+# CATATAN:
+#   - Ini bukan "AI OCR", jadi tidak "membaca" teksnya -- murni
+#     mendeteksi pola visual (putih + outline tajam) di pita
+#     bawah foto. Kalau ada elemen lain di pita bawah yang juga
+#     putih terang & bertekstur tajam (misal renda putih, teks
+#     lain), itu bisa ikut kehapus -- makanya parameter di
+#     sidebar bisa diatur & ada preview mask sebelum download.
+# ============================================================
+
+
+# ============================================================
+# IMPORT
 # ============================================================
 
 import io
 import os
-import base64
 import zipfile
-from pathlib import Path
 
-import streamlit as st
+import cv2
 import numpy as np
+import streamlit as st
 
 from PIL import Image, ImageOps
-from google import genai
 
 
 # ============================================================
-# CONFIG
+# ============================================================
+# KONFIGURASI DEFAULT
+# ============================================================
 # ============================================================
 
-# Gemini native image editing model.
-GEMINI_IMAGE_MODEL = "gemini-flash-lite-latest"
+DEFAULT_TOP_PCT = 0.72       # mulai cari dari 72% tinggi foto ke bawah
+DEFAULT_LEFT_PCT = 0.0
+DEFAULT_RIGHT_PCT = 1.0
+DEFAULT_BOTTOM_PCT = 1.0
 
-# Ukuran output Gemini.
-# 2K dipilih agar hasil edit lebih detail daripada 1K.
-GEMINI_IMAGE_SIZE = "2K"
+DEFAULT_WHITE_THRESH = 190   # ambang piksel dianggap "putih terang"
+DEFAULT_EDGE_THRESH = 25     # ambang kekuatan tepi (outline)
+DEFAULT_DILATE_PX = 7        # pelebaran mask akhir (px) sebelum inpaint
+DEFAULT_INPAINT_RADIUS = 5
 
-SUPPORTED_IMAGES = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".webp",
-}
-
-
-# ============================================================
-# PAGE
-# ============================================================
-
-st.set_page_config(
-    page_title="Timestamp Remover | Gemini AI",
-    page_icon="🧹",
-    layout="centered",
-    initial_sidebar_state="collapsed",
-)
+MIN_BLOB_AREA = 15            # buang noda mask yang terlalu kecil
 
 
 # ============================================================
-# CSS
+# ============================================================
+# LOAD FOTO DENGAN FIX ORIENTASI EXIF
+# ============================================================
 # ============================================================
 
-st.markdown(
-    """
-    <style>
-    .hero-title {
-        font-size: 2.1rem;
-        font-weight: 800;
-        letter-spacing: -0.5px;
-        margin-bottom: 0.2rem;
-    }
+def load_pil_image_fixed_orientation(file_bytes):
 
-    .hero-badge {
-        display: inline-block;
-        font-size: 0.75rem;
-        font-weight: 700;
-        padding: 3px 10px;
-        border-radius: 20px;
-        background: linear-gradient(135deg, #059669, #10b981);
-        color: white !important;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-        margin-bottom: 0.6rem;
-    }
+    pil_image = Image.open(io.BytesIO(file_bytes))
 
-    .hero-desc {
-        color: var(--text-color, #6b7280);
-        font-size: 0.95rem;
-        margin-bottom: 1.2rem;
-    }
+    pil_image = ImageOps.exif_transpose(pil_image)
 
-    div[data-testid="stButton"] button,
-    div[data-testid="stDownloadButton"] button {
-        border-radius: 10px;
-        font-weight: 600;
-    }
+    pil_image = pil_image.convert("RGB")
 
-    .info-card {
-        padding: 12px 16px;
-        border-radius: 10px;
-        background: rgba(140, 140, 140, 0.06);
-        border-left: 4px solid #10b981;
-        margin: 10px 0;
-        font-size: 0.9rem;
-    }
-
-    .footer-text {
-        text-align: center;
-        font-size: 0.82rem;
-        opacity: 0.75;
-        padding-top: 1rem;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+    return pil_image
 
 
 # ============================================================
-# SESSION STATE
+# ============================================================
+# DETEKSI + HAPUS TIMESTAMP
+# ============================================================
 # ============================================================
 
-if "uploader_version" not in st.session_state:
-    st.session_state.uploader_version = 0
+def remove_timestamp(
+    image_bgr,
+    top_pct=DEFAULT_TOP_PCT,
+    left_pct=DEFAULT_LEFT_PCT,
+    right_pct=DEFAULT_RIGHT_PCT,
+    bottom_pct=DEFAULT_BOTTOM_PCT,
+    white_thresh=DEFAULT_WHITE_THRESH,
+    edge_thresh=DEFAULT_EDGE_THRESH,
+    dilate_px=DEFAULT_DILATE_PX,
+    inpaint_radius=DEFAULT_INPAINT_RADIUS,
+):
 
-if "remove_result" not in st.session_state:
-    st.session_state.remove_result = None
+    height, width = image_bgr.shape[:2]
 
+    top = int(height * top_pct)
+    bottom = int(height * bottom_pct)
+    left = int(width * left_pct)
+    right = int(width * right_pct)
 
-def reset_app():
-    st.session_state.uploader_version += 1
-    st.session_state.remove_result = None
+    roi = image_bgr[top:bottom, left:right]
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+    # --------------------------------------------------------
+    # Kekuatan tepi lokal (outline teks = kontras sangat tajam)
+    # --------------------------------------------------------
+
+    laplacian = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
+
+    edge_magnitude = np.abs(laplacian)
+
+    edge_magnitude = cv2.normalize(
+        edge_magnitude, None, 0, 255, cv2.NORM_MINMAX
+    ).astype(np.uint8)
+
+    _, edge_mask = cv2.threshold(
+        edge_magnitude, edge_thresh, 255, cv2.THRESH_BINARY
+    )
+
+    # --------------------------------------------------------
+    # Piksel putih terang (isi teks)
+    # --------------------------------------------------------
+
+    _, white_mask = cv2.threshold(
+        gray, white_thresh, 255, cv2.THRESH_BINARY
+    )
+
+    edge_dilated = cv2.dilate(
+        edge_mask, np.ones((5, 5), np.uint8), iterations=1
+    )
+
+    # Teks = putih terang YANG berdekatan dengan tepi tajam
+    # (menyaring area putih polos besar seperti lantai/tembok)
+    text_mask = cv2.bitwise_and(white_mask, edge_dilated)
+
+    # Tangkap juga outline hitamnya (tepi tajam yang menempel
+    # ke area teks putih di atas)
+    text_dilated = cv2.dilate(
+        text_mask, np.ones((9, 9), np.uint8), iterations=1
+    )
+
+    outline_mask = cv2.bitwise_and(edge_mask, text_dilated)
+
+    combined_mask = cv2.bitwise_or(text_mask, outline_mask)
+
+    # Sambung celah antar-huruf/antar-baris, lalu beri margin aman
+    combined_mask = cv2.morphologyEx(
+        combined_mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8)
+    )
+
+    combined_mask = cv2.dilate(
+        combined_mask,
+        np.ones((dilate_px, dilate_px), np.uint8),
+        iterations=1,
+    )
+
+    # Buang noda kecil (bukan bagian teks)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        combined_mask, connectivity=8
+    )
+
+    clean_mask = np.zeros_like(combined_mask)
+
+    for label_index in range(1, num_labels):
+
+        area = stats[label_index, cv2.CC_STAT_AREA]
+
+        if area >= MIN_BLOB_AREA:
+
+            clean_mask[labels == label_index] = 255
+
+    full_mask = np.zeros((height, width), dtype=np.uint8)
+
+    full_mask[top:bottom, left:right] = clean_mask
+
+    detected_px = int(np.count_nonzero(full_mask))
+
+    inpainted = cv2.inpaint(
+        image_bgr, full_mask, inpaint_radius, cv2.INPAINT_TELEA
+    )
+
+    return inpainted, full_mask, detected_px
 
 
 # ============================================================
-# IMAGE HELPERS
+# ============================================================
+# HELPER: ENCODE HASIL KE BYTES
+# ============================================================
 # ============================================================
 
-def load_pil_image(uploaded_file):
-    """
-    Baca foto + normalisasi EXIF orientation.
-    """
-    image = Image.open(uploaded_file)
+def encode_image_bytes(image_bgr, ext):
 
-    image = ImageOps.exif_transpose(image)
+    if ext.lower() in [".jpg", ".jpeg"]:
 
-    return image.convert("RGB")
-
-
-def image_to_bytes(image, extension):
-    """
-    Encode PIL image ke format output yang sama.
-    """
-    buffer = io.BytesIO()
-
-    ext = extension.lower()
-
-    if ext in [".jpg", ".jpeg"]:
-
-        image.save(
-            buffer,
-            format="JPEG",
-            quality=95,
-            subsampling=0,
-        )
-
-    elif ext == ".png":
-
-        image.save(
-            buffer,
-            format="PNG",
-        )
-
-    elif ext == ".webp":
-
-        image.save(
-            buffer,
-            format="WEBP",
-            quality=95,
+        ok, buf = cv2.imencode(
+            ".jpg", image_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95]
         )
 
     else:
 
-        image.save(
-            buffer,
-            format="JPEG",
-            quality=95,
-        )
+        ok, buf = cv2.imencode(".png", image_bgr)
 
-    return buffer.getvalue()
+    if not ok:
 
-
-def get_image_from_gemini_response(response):
-    """
-    Mengambil gambar hasil dari Gemini SDK.
-
-    Mendukung response.parts / inline_data
-    dari generate_content.
-    """
-
-    # Cara utama untuk google-genai generate_content.
-    for part in getattr(response, "parts", []) or []:
-
-        inline_data = getattr(
-            part,
-            "inline_data",
-            None,
-        )
-
-        if inline_data is not None:
-
-            # SDK biasanya menyediakan as_image().
-            try:
-
-                result_image = part.as_image()
-
-                if result_image is not None:
-                    return result_image.convert("RGB")
-
-            except Exception:
-                pass
-
-            # Fallback jika data tersedia sebagai bytes/base64.
-            raw_data = getattr(
-                inline_data,
-                "data",
-                None,
-            )
-
-            if raw_data:
-
-                if isinstance(raw_data, bytes):
-
-                    return Image.open(
-                        io.BytesIO(raw_data)
-                    ).convert("RGB")
-
-                if isinstance(raw_data, str):
-
-                    return Image.open(
-                        io.BytesIO(
-                            base64.b64decode(raw_data)
-                        )
-                    ).convert("RGB")
-
-    # Fallback untuk SDK response yang menyediakan candidates.
-    for candidate in getattr(response, "candidates", []) or []:
-
-        content = getattr(
-            candidate,
-            "content",
-            None,
-        )
-
-        for part in getattr(
-            content,
-            "parts",
-            [],
-        ) or []:
-
-            inline_data = getattr(
-                part,
-                "inline_data",
-                None,
-            )
-
-            if inline_data is None:
-                continue
-
-            raw_data = getattr(
-                inline_data,
-                "data",
-                None,
-            )
-
-            if isinstance(raw_data, bytes):
-
-                return Image.open(
-                    io.BytesIO(raw_data)
-                ).convert("RGB")
-
-            if isinstance(raw_data, str):
-
-                return Image.open(
-                    io.BytesIO(
-                        base64.b64decode(raw_data)
-                    )
-                ).convert("RGB")
-
-    return None
-
-
-# ============================================================
-# GEMINI NATIVE IMAGE EDIT
-# ============================================================
-
-TIMESTAMP_REMOVE_PROMPT = """
-Edit the provided photograph.
-
-TASK:
-Remove ONLY the GPS camera timestamp overlay from the photograph.
-
-The timestamp is the camera-added overlay that may contain:
-- GPS coordinates
-- location/address
-- date
-- time
-- timezone such as WIB/WITA/WIT
-- multiple lines of timestamp text
-
-IMPORTANT:
-1. Do not crop the image.
-2. Do not change the camera angle.
-3. Do not change the composition.
-4. Do not change any real objects in the photograph.
-5. Do not change the documents, products, cables, remote, table,
-   bed sheet, floor, walls, or any other natural photographic content.
-6. Do not remove printed text that is part of a real physical object.
-7. Remove ONLY the camera timestamp overlay.
-8. Reconstruct the background behind the removed timestamp so it
-   looks naturally photographed.
-9. Preserve the original lighting, shadows, colors, texture,
-   perspective, and photographic noise/grain.
-10. Do not create new objects.
-11. Do not add any text.
-12. Do not leave blur, smudge, mosaic, clone artifacts, or visible
-    evidence that something was removed.
-13. Keep the result photorealistic.
-14. Preserve the original image dimensions/aspect ratio as closely
-    as the image editing model allows.
-
-The camera timestamp may be near the bottom edge or another edge
-of the photograph.
-
-Again: REMOVE THE CAMERA TIMESTAMP ONLY.
-Do not edit any other text printed on physical objects.
-""".strip()
-
-
-def remove_timestamp_with_gemini(
-    image,
-    api_key,
-):
-    """
-    Kirim foto langsung ke Gemini image-editing model.
-    Gemini melakukan detection + semantic removal + reconstruction.
-    """
-
-    client = genai.Client(
-        api_key=api_key,
-    )
-
-    # Convert input ke PNG agar lossless saat dikirim ke model.
-    image_buffer = io.BytesIO()
-
-    image.save(
-        image_buffer,
-        format="PNG",
-    )
-
-    image_bytes = image_buffer.getvalue()
-
-    # Legacy generate_content API dengan model image editing.
-    # Google mendokumentasikan image editing sebagai
-    # text + image -> image.
-    response = client.models.generate_content(
-        model=GEMINI_IMAGE_MODEL,
-        contents=[
-            {
-                "text": TIMESTAMP_REMOVE_PROMPT,
-            },
-            {
-                "inline_data": {
-                    "mime_type": "image/png",
-                    "data": image_bytes,
-                }
-            },
-        ],
-    )
-
-    result_image = get_image_from_gemini_response(
-        response
-    )
-
-    if result_image is None:
-
-        response_text = getattr(
-            response,
-            "text",
-            "",
-        )
-
-        raise RuntimeError(
-            "Gemini tidak mengembalikan gambar hasil. "
-            + (
-                f"Response: {response_text[:500]}"
-                if response_text
-                else ""
-            )
-        )
-
-    # Gemini image model dapat menghasilkan ukuran output
-    # yang berbeda. Kita kembalikan ke dimensi asli agar
-    # workflow dokumentasi tidak mengubah resolusi foto.
-    if result_image.size != image.size:
-
-        result_image = result_image.resize(
-            image.size,
-            Image.Resampling.LANCZOS,
-        )
-
-    return result_image
-
-
-# ============================================================
-# ZIP SAFETY + STRUCTURE
-# ============================================================
-
-def is_supported_image(filename):
-    return (
-        Path(filename).suffix.lower()
-        in SUPPORTED_IMAGES
-    )
-
-
-def safe_zip_path(filename):
-    """
-    Mencegah path traversal seperti ../../file.
-    """
-
-    normalized = os.path.normpath(
-        filename.replace("\\", "/")
-    )
-
-    if (
-        normalized.startswith("../")
-        or normalized == ".."
-        or normalized.startswith("/")
-        or os.path.isabs(normalized)
-    ):
         return None
 
-    return normalized
+    return buf.tobytes()
 
 
-def get_zip_image_members(zip_bytes):
+IMAGE_EXTS = (".jpg", ".jpeg", ".png")
+
+
+def collect_input_files(uploaded_files):
     """
-    Mengambil daftar gambar dari ZIP.
-    """
-
-    with zipfile.ZipFile(
-        io.BytesIO(zip_bytes),
-        "r",
-    ) as zf:
-
-        members = []
-
-        for info in zf.infolist():
-
-            if info.is_dir():
-                continue
-
-            safe_name = safe_zip_path(
-                info.filename
-            )
-
-            if safe_name is None:
-                continue
-
-            if is_supported_image(
-                safe_name
-            ):
-                members.append(
-                    info.filename
-                )
-
-        return members
-
-
-def process_zip(
-    zip_bytes,
-    api_key,
-    progress_callback=None,
-):
-    """
-    Proses ZIP tanpa mengubah struktur.
-
-    Input:
-        Paket.zip
-        ├── Folder A/
-        │   ├── foto1.jpg
-        │   └── foto2.jpg
-        └── Folder B/
-            └── foto3.jpg
-
-    Output:
-        Paket.zip
-        ├── Folder A/
-        │   ├── foto1.jpg
-        │   └── foto2.jpg
-        └── Folder B/
-            └── foto3.jpg
-
-    Nama file sama persis.
-    Folder sama persis.
+    Terima list file dari st.file_uploader (foto biasa dan/atau
+    .zip). Kembalikan list of (filename, raw_bytes) untuk semua
+    foto yang ditemukan.
     """
 
-    source = io.BytesIO(
-        zip_bytes
-    )
+    collected = []
 
-    output = io.BytesIO()
+    for uploaded in uploaded_files:
 
-    with zipfile.ZipFile(
-        source,
-        "r",
-    ) as input_zip:
+        name_lower = uploaded.name.lower()
 
-        image_members = [
-            info.filename
-            for info in input_zip.infolist()
-            if (
-                not info.is_dir()
-                and safe_zip_path(info.filename)
-                and is_supported_image(info.filename)
-            )
-        ]
+        if name_lower.endswith(".zip"):
 
-        if not image_members:
+            with zipfile.ZipFile(uploaded) as zip_file:
 
-            raise ValueError(
-                "ZIP tidak berisi JPG/JPEG/PNG/WEBP."
-            )
+                for zip_info in zip_file.infolist():
 
-        total = len(image_members)
-        completed = 0
+                    if zip_info.is_dir():
+                        continue
 
-        with zipfile.ZipFile(
-            output,
-            "w",
-            compression=zipfile.ZIP_DEFLATED,
-        ) as output_zip:
+                    inner_name = zip_info.filename
 
-            for info in input_zip.infolist():
+                    if not inner_name.lower().endswith(IMAGE_EXTS):
+                        continue
 
-                # Folder
-                if info.is_dir():
+                    if "__MACOSX" in inner_name:
+                        continue
 
-                    safe_name = safe_zip_path(
-                        info.filename
-                    )
+                    with zip_file.open(zip_info) as inner_file:
 
-                    if safe_name is not None:
-
-                        output_zip.writestr(
-                            info,
-                            b"",
-                        )
-
-                    continue
-
-                safe_name = safe_zip_path(
-                    info.filename
-                )
-
-                if safe_name is None:
-                    continue
-
-                original_bytes = input_zip.read(
-                    info.filename
-                )
-
-                # --------------------------------------------
-                # IMAGE
-                # --------------------------------------------
-
-                if info.filename in image_members:
-
-                    try:
-
-                        image = Image.open(
-                            io.BytesIO(
-                                original_bytes
+                        collected.append(
+                            (
+                                os.path.basename(inner_name),
+                                inner_file.read(),
                             )
                         )
 
-                        image = ImageOps.exif_transpose(
-                            image
-                        ).convert("RGB")
+        elif name_lower.endswith(IMAGE_EXTS):
 
-                        result_image = remove_timestamp_with_gemini(
-                            image,
-                            api_key,
-                        )
+            collected.append((uploaded.name, uploaded.getvalue()))
 
-                        extension = Path(
-                            info.filename
-                        ).suffix.lower()
+    return collected
 
-                        result_bytes = image_to_bytes(
-                            result_image,
-                            extension,
-                        )
 
-                        # Nama + path EXACT sama.
-                        output_zip.writestr(
-                            info.filename,
-                            result_bytes,
-                        )
+# ============================================================
+# ============================================================
+# STREAMLIT UI
+# ============================================================
+# ============================================================
 
-                    except Exception:
+st.set_page_config(
+    page_title="Timestamp Remover | GPS Camera Style",
+    page_icon="🧹",
+    layout="centered",
+    initial_sidebar_state="expanded",
+)
 
-                        # Jika Gemini gagal pada foto tertentu,
-                        # foto asli tetap dimasukkan agar struktur
-                        # ZIP tidak rusak/hilang.
-                        output_zip.writestr(
-                            info.filename,
-                            original_bytes,
-                        )
+st.markdown("## 🧹 Timestamp Remover")
+st.caption(
+    "Hapus otomatis watermark timestamp GPS Map Camera "
+    "(koordinat, lokasi, tanggal & jam) dari foto. "
+    "Bisa upload banyak foto sekaligus atau 1 file .zip."
+)
 
-                    completed += 1
+# ------------------------------------------------------------
+# SIDEBAR: PARAMETER DETEKSI
+# ------------------------------------------------------------
 
-                    if progress_callback:
+with st.sidebar:
 
-                        progress_callback(
-                            completed,
-                            total,
-                        )
+    st.markdown("### ⚙️ Parameter Deteksi")
 
-                # --------------------------------------------
-                # NON-IMAGE FILE
-                # --------------------------------------------
+    st.caption(
+        "Default biasanya sudah cukup. Atur ulang kalau hasil "
+        "kurang bersih atau malah kehapus bagian yang bukan teks."
+    )
 
-                else:
+    top_pct = st.slider(
+        "Mulai area deteksi dari (% tinggi foto)",
+        min_value=40,
+        max_value=95,
+        value=int(DEFAULT_TOP_PCT * 100),
+        step=1,
+        help="Timestamp GPS Map Camera selalu di pojok kiri-bawah. "
+        "Naikkan angka ini kalau timestamp-nya cuma 1-2 baris pendek "
+        "(area deteksi jadi lebih sempit / lebih ke bawah).",
+    ) / 100.0
 
-                    output_zip.writestr(
-                        info.filename,
-                        original_bytes,
-                    )
+    white_thresh = st.slider(
+        "Ambang kecerahan teks (white threshold)",
+        min_value=140,
+        max_value=250,
+        value=DEFAULT_WHITE_THRESH,
+        step=5,
+    )
 
-    return (
-        output.getvalue(),
-        total,
+    edge_thresh = st.slider(
+        "Sensitivitas outline (edge threshold)",
+        min_value=5,
+        max_value=80,
+        value=DEFAULT_EDGE_THRESH,
+        step=5,
+        help="Turunkan kalau outline teks tipis/tidak terdeteksi. "
+        "Naikkan kalau area lain (misal tekstur lantai) ikut terdeteksi.",
+    )
+
+    dilate_px = st.slider(
+        "Margin aman sekitar teks (px)",
+        min_value=1,
+        max_value=20,
+        value=DEFAULT_DILATE_PX,
+        step=1,
+    )
+
+    inpaint_radius = st.slider(
+        "Radius rekonstruksi latar (inpaint radius)",
+        min_value=1,
+        max_value=15,
+        value=DEFAULT_INPAINT_RADIUS,
+        step=1,
+    )
+
+    show_mask_preview = st.checkbox(
+        "Tampilkan preview area yang terdeteksi (mask)",
+        value=True,
     )
 
 
-# ============================================================
-# HEADER
-# ============================================================
+# ------------------------------------------------------------
+# UPLOAD
+# ------------------------------------------------------------
 
-st.markdown(
-    '<div class="hero-badge">GEMINI NATIVE IMAGE EDITING</div>',
-    unsafe_allow_html=True,
+st.markdown("### 1️⃣ Upload Foto")
+
+uploaded_files = st.file_uploader(
+    "Pilih foto (JPG/PNG) atau upload 1 file .zip berisi banyak foto",
+    type=["jpg", "jpeg", "png", "zip"],
+    accept_multiple_files=True,
+    help="Bisa pilih banyak file foto sekaligus, atau cukup 1 file .zip.",
 )
 
-st.markdown(
-    '<div class="hero-title">🧹 Timestamp Remover</div>',
-    unsafe_allow_html=True,
-)
+if not uploaded_files:
 
-st.markdown(
-    '<div class="hero-desc">'
-    'Upload satu foto atau ZIP. Gemini langsung melakukan '
-    '<b>semantic image editing</b> untuk menghapus timestamp '
-    'dan merekonstruksi background secara natural.'
-    '</div>',
-    unsafe_allow_html=True,
-)
+    st.info("📷 Belum ada foto/zip yang diupload.")
 
+    st.stop()
 
-# ============================================================
-# API KEY
-# ============================================================
+input_files = collect_input_files(uploaded_files)
 
-gemini_api_key = st.secrets.get(
-    "GEMINI_API_KEY",
-    "",
-)
-
-if not gemini_api_key:
+if not input_files:
 
     st.warning(
-        "⚠️ **GEMINI_API_KEY belum dikonfigurasi.** "
-        "Tambahkan `GEMINI_API_KEY` pada Streamlit Secrets."
+        "⚠️ Tidak ada foto (JPG/PNG) yang ditemukan dari file yang diupload."
     )
 
+    st.stop()
 
-# ============================================================
-# INPUT
-# ============================================================
+st.success(f"✅ {len(input_files)} foto siap diproses.")
 
-st.markdown("### 1️⃣ Upload Foto atau ZIP")
 
-uploaded = st.file_uploader(
-    "Upload 1 foto atau 1 ZIP",
-    type=[
-        "jpg",
-        "jpeg",
-        "png",
-        "webp",
-        "zip",
-    ],
-    key=f"uploader_{st.session_state.uploader_version}",
+# ------------------------------------------------------------
+# PROSES
+# ------------------------------------------------------------
+
+st.markdown("### 2️⃣ Proses & Preview")
+
+process_clicked = st.button(
+    "🚀 HAPUS TIMESTAMP DARI SEMUA FOTO",
+    type="primary",
+    use_container_width=True,
 )
 
+if process_clicked:
 
-input_mode = None
-single_image = None
-zip_bytes = None
+    results = []
 
+    progress_bar = st.progress(0.0)
 
-if uploaded is not None:
-
-    extension = Path(
-        uploaded.name
-    ).suffix.lower()
-
-    # ========================================================
-    # SINGLE PHOTO
-    # ========================================================
-
-    if extension != ".zip":
-
-        input_mode = "single"
+    for index, (filename, raw_bytes) in enumerate(input_files):
 
         try:
 
-            single_image = load_pil_image(
-                uploaded
+            pil_image = load_pil_image_fixed_orientation(raw_bytes)
+
+            image_rgb = np.array(pil_image)
+
+            image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+
+            result_bgr, mask, detected_px = remove_timestamp(
+                image_bgr,
+                top_pct=top_pct,
+                white_thresh=white_thresh,
+                edge_thresh=edge_thresh,
+                dilate_px=dilate_px,
+                inpaint_radius=inpaint_radius,
             )
 
-            width, height = (
-                single_image.size
-            )
+            name, ext = os.path.splitext(filename)
 
-            col1, col2, col3 = st.columns(3)
+            if not ext:
+                ext = ".jpg"
 
-            with col1:
-                st.metric(
-                    "📄 File",
-                    uploaded.name,
-                )
+            output_name = name + "_clean" + ext
 
-            with col2:
-                st.metric(
-                    "📐 Resolusi",
-                    f"{width} × {height}",
-                )
+            encoded_bytes = encode_image_bytes(result_bgr, ext)
 
-            with col3:
-                st.metric(
-                    "📦 Format",
-                    extension.replace(".", "").upper(),
-                )
-
-            st.image(
-                single_image,
-                caption="Original",
-                use_container_width=True,
+            results.append(
+                {
+                    "filename": filename,
+                    "output_name": output_name,
+                    "original_bgr": image_bgr,
+                    "result_bgr": result_bgr,
+                    "mask": mask,
+                    "detected_px": detected_px,
+                    "encoded_bytes": encoded_bytes,
+                    "mime": "image/jpeg" if ext.lower() in [".jpg", ".jpeg"] else "image/png",
+                }
             )
 
         except Exception as error:
 
-            st.error(
-                f"❌ Foto tidak dapat dibaca: {error}"
-            )
+            st.error(f"❌ Gagal memproses `{filename}`: {error}")
 
-    # ========================================================
-    # ZIP
-    # ========================================================
+        progress_bar.progress((index + 1) / len(input_files))
 
-    else:
+    st.session_state["remover_results"] = results
 
-        input_mode = "zip"
 
-        zip_bytes = uploaded.getvalue()
+# ------------------------------------------------------------
+# HASIL
+# ------------------------------------------------------------
 
-        try:
+results = st.session_state.get("remover_results")
 
-            image_members = get_zip_image_members(
-                zip_bytes
-            )
+if results:
 
-            if not image_members:
+    st.markdown("---")
+    st.markdown("### ✨ Hasil")
 
-                st.error(
-                    "❌ ZIP tidak berisi foto yang didukung."
+    zero_detect_count = sum(1 for r in results if r["detected_px"] == 0)
+
+    if zero_detect_count > 0:
+
+        st.warning(
+            f"⚠️ {zero_detect_count} dari {len(results)} foto TIDAK terdeteksi "
+            "ada timestamp di area yang dicari. Coba longgarkan parameter di "
+            "sidebar (misal turunkan '% tinggi foto' atau 'edge threshold')."
+        )
+
+    for r in results:
+
+        with st.container(border=True):
+
+            st.markdown(f"**{r['filename']}**")
+
+            col_before, col_after = st.columns(2)
+
+            with col_before:
+
+                st.image(
+                    cv2.cvtColor(r["original_bgr"], cv2.COLOR_BGR2RGB),
+                    caption="Sebelum",
+                    use_container_width=True,
                 )
 
-            else:
+            with col_after:
 
-                folders = sorted(
-                    {
-                        str(
-                            Path(member).parent
-                        )
-                        for member in image_members
-                        if str(
-                            Path(member).parent
-                        ) != "."
-                    }
+                st.image(
+                    cv2.cvtColor(r["result_bgr"], cv2.COLOR_BGR2RGB),
+                    caption="Sesudah",
+                    use_container_width=True,
                 )
 
-                st.success(
-                    f"📦 **{len(image_members)} foto** "
-                    f"ditemukan dalam ZIP."
-                )
+            if show_mask_preview:
 
-                col1, col2 = st.columns(2)
+                with st.expander("🔍 Area yang terdeteksi & dihapus (mask)"):
 
-                with col1:
-
-                    st.metric(
-                        "📷 Total Foto",
-                        len(image_members),
+                    st.image(
+                        r["mask"],
+                        caption=f"Terdeteksi ~{r['detected_px']:,} piksel",
+                        use_container_width=True,
                     )
 
-                with col2:
-
-                    st.metric(
-                        "📁 Total Folder",
-                        len(folders),
-                    )
-
-                with st.expander(
-                    "📂 Lihat struktur ZIP",
-                    expanded=False,
-                ):
-
-                    for member in image_members[:200]:
-
-                        st.code(
-                            member,
-                            language=None,
-                        )
-
-                    if len(image_members) > 200:
-
-                        st.caption(
-                            f"... {len(image_members) - 200} foto lainnya."
-                        )
-
-        except Exception as error:
-
-            st.error(
-                f"❌ ZIP tidak dapat dibaca: {error}"
+            st.download_button(
+                label=f"⬇️ Download {r['output_name']}",
+                data=r["encoded_bytes"],
+                file_name=r["output_name"],
+                mime=r["mime"],
+                key=f"dl_{r['filename']}",
             )
 
+    # ----------------------------------------------------
+    # DOWNLOAD SEMUA SEKALIGUS (ZIP)
+    # ----------------------------------------------------
 
-# ============================================================
-# REMOVE
-# ============================================================
+    st.markdown("---")
 
-st.markdown("### 2️⃣ Remove Timestamp")
+    zip_buffer = io.BytesIO()
 
-ready = (
-    bool(gemini_api_key)
-    and (
-        (
-            input_mode == "single"
-            and single_image is not None
-        )
-        or
-        (
-            input_mode == "zip"
-            and zip_bytes is not None
-        )
-    )
-)
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_out:
 
+        for r in results:
 
-with st.container(border=True):
+            zip_out.writestr(r["output_name"], r["encoded_bytes"])
 
-    st.markdown(
-        """
-        <div class="info-card">
-        🧠 <b>Mode Gemini Native Editing</b><br>
-        Foto dikirim langsung ke Gemini sebagai gambar untuk diedit.
-        Gemini yang menentukan lokasi timestamp, menghapusnya,
-        dan mengisi kembali background. Tidak ada rectangle mask
-        atau threshold pixel dari OpenCV.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    remove_button = st.button(
-        "🧹 REMOVE TIMESTAMP DENGAN GEMINI",
+    st.download_button(
+        label=f"⬇️ DOWNLOAD SEMUA ({len(results)} foto) SEBAGAI .ZIP",
+        data=zip_buffer.getvalue(),
+        file_name="foto_tanpa_timestamp.zip",
+        mime="application/zip",
         type="primary",
         use_container_width=True,
-        disabled=not ready,
     )
 
 
-if remove_button:
-
-    try:
-
-        # ========================================================
-        # SINGLE
-        # ========================================================
-
-        if input_mode == "single":
-
-            with st.spinner(
-                "🤖 Gemini sedang mengedit foto dan menghapus timestamp..."
-            ):
-
-                result_image = remove_timestamp_with_gemini(
-                    single_image,
-                    gemini_api_key,
-                )
-
-            output_name = uploaded.name
-
-            output_bytes = image_to_bytes(
-                result_image,
-                Path(output_name).suffix,
-            )
-
-            st.session_state.remove_result = {
-                "mode": "single",
-                "image": result_image,
-                "bytes": output_bytes,
-                "name": output_name,
-            }
-
-            st.rerun()
-
-        # ========================================================
-        # ZIP
-        # ========================================================
-
-        else:
-
-            progress = st.progress(
-                0,
-                text="📦 Menyiapkan ZIP...",
-            )
-
-            status = st.empty()
-
-            def update_progress(
-                current,
-                total,
-            ):
-
-                ratio = (
-                    current / total
-                    if total
-                    else 1
-                )
-
-                progress.progress(
-                    ratio,
-                    text=(
-                        f"🧹 Gemini mengedit foto "
-                        f"{current}/{total}"
-                    ),
-                )
-
-                status.caption(
-                    f"Foto {current} dari {total} sedang diproses."
-                )
-
-            with st.spinner(
-                "🤖 Gemini sedang memproses seluruh foto..."
-            ):
-
-                result_zip, total = process_zip(
-                    zip_bytes,
-                    gemini_api_key,
-                    update_progress,
-                )
-
-            progress.progress(
-                1.0,
-                text=f"✅ Selesai: {total} foto",
-            )
-
-            output_name = uploaded.name
-
-            st.session_state.remove_result = {
-                "mode": "zip",
-                "bytes": result_zip,
-                "name": output_name,
-                "total": total,
-            }
-
-            st.rerun()
-
-    except Exception as error:
-
-        st.error(
-            f"❌ Proses gagal: {error}"
-        )
-
-
-# ============================================================
-# RESULT
-# ============================================================
-
-result = st.session_state.remove_result
-
-
-if result is not None:
-
-    st.markdown("### 3️⃣ Hasil")
-
-    with st.container(border=True):
-
-        if result["mode"] == "single":
-
-            st.success(
-                "🎉 Timestamp berhasil diproses oleh Gemini."
-            )
-
-            st.image(
-                result["image"],
-                caption="Hasil Gemini",
-                use_container_width=True,
-            )
-
-            col1, col2 = st.columns([2, 1])
-
-            with col1:
-
-                st.download_button(
-                    "⬇️ DOWNLOAD FOTO",
-                    data=result["bytes"],
-                    file_name=result["name"],
-                    mime=(
-                        "image/jpeg"
-                        if Path(
-                            result["name"]
-                        ).suffix.lower()
-                        in [".jpg", ".jpeg"]
-                        else "image/png"
-                    ),
-                    type="primary",
-                    use_container_width=True,
-                )
-
-            with col2:
-
-                if st.button(
-                    "🔄 Foto Baru",
-                    use_container_width=True,
-                ):
-
-                    reset_app()
-                    st.rerun()
-
-        else:
-
-            st.success(
-                f"🎉 **ZIP selesai diproses.** "
-                f"{result['total']} foto diproses."
-            )
-
-            st.markdown(
-                """
-                <div class="info-card">
-                📁 Struktur folder dan subfolder tetap sama.<br>
-                📄 Nama setiap foto tetap sama persis seperti input.<br>
-                📦 ZIP output menggunakan nama ZIP input.
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            col1, col2 = st.columns([2, 1])
-
-            with col1:
-
-                st.download_button(
-                    "⬇️ DOWNLOAD ZIP",
-                    data=result["bytes"],
-                    file_name=result["name"],
-                    mime="application/zip",
-                    type="primary",
-                    use_container_width=True,
-                )
-
-            with col2:
-
-                if st.button(
-                    "🔄 ZIP Baru",
-                    use_container_width=True,
-                ):
-
-                    reset_app()
-                    st.rerun()
-
-
-# ============================================================
+# ------------------------------------------------------------
 # FOOTER
-# ============================================================
+# ------------------------------------------------------------
 
 st.markdown("---")
 
-st.markdown(
-    """
-    <div class="footer-text">
-        <b>Timestamp Remover V9.0</b><br>
-        Gemini Native Image Editing
-    </div>
-    """,
-    unsafe_allow_html=True,
+st.caption(
+    "Deteksi berbasis pola piksel (putih terang + outline tajam) di "
+    "pita bawah foto -- tanpa AI/API key. Kalau hasil kurang pas, "
+    "atur parameter di sidebar lalu proses ulang."
 )
