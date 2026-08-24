@@ -43,7 +43,7 @@ from google import genai
 # ============================================================
 
 # Gemini native image editing model.
-GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
+GEMINI_IMAGE_MODEL = "gemini-flash-lite-latest"
 
 # Ukuran output Gemini.
 # 2K dipilih agar hasil edit lebih detail daripada 1K.
