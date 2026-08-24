@@ -79,7 +79,7 @@ DEFAULT_SMOOTH_SCALES = (0.25, 0.5, 1.0)   # dari kasar -> halus
 DEFAULT_FEATHER_PX = 3        # kelembutan tepi (gaussian sigma, px)
 
 # --- Gemini / Nano Banana ---
-GEMINI_MODEL_NAME = "gemini-flash-lite-latest"
+GEMINI_MODEL_NAME = "gemini-2.5-flash-image"
 
 DEFAULT_GEMINI_PROMPT = (
     "This photo has a GPS-Map-Camera style timestamp overlay in the "
