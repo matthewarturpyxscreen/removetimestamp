@@ -1,26 +1,23 @@
 # ============================================================
-# TIMESTAMP REMOVER V4
-# CLOUDflare Workers AI + CLASSIC
+# TIMESTAMP REMOVER V5
+# CLOUDFLARE WORKERS AI + CLASSIC
 # ============================================================
 #
-# FITUR
+# V5
 # ------------------------------------------------------------
-# 1. Upload satu / banyak foto
-# 2. Upload ZIP
-# 3. Struktur folder ZIP dipertahankan
-# 4. Nama file asli dipertahankan
-# 5. Mode Classic:
-#       - Deteksi timestamp
-#       - OpenCV Inpainting
-#
-# 6. Mode AI:
-#       - Deteksi timestamp
-#       - Buat mask
-#       - Cloudflare Workers AI
-#       - Stable Diffusion v1.5 Inpainting
-#
-# 7. Tidak menggunakan Gemini
-# 8. Tidak membutuhkan google-genai
+# - Remove timestamp GPS Camera
+# - Cloudflare Workers AI REST API
+# - stable-diffusion-v1-5-inpainting
+# - image + mask dikirim sebagai uint8 array
+# - Upload single photo
+# - Upload multiple photos
+# - Upload ZIP
+# - Struktur folder ZIP dipertahankan
+# - Nama file asli dipertahankan
+# - Output ZIP
+# - Preview Before / After
+# - Classic OpenCV fallback
+# - Tidak menggunakan Gemini
 #
 # ============================================================
 
@@ -33,7 +30,6 @@ import io
 import os
 import time
 import zipfile
-import base64
 
 import cv2
 import numpy as np
@@ -44,7 +40,7 @@ from PIL import Image, ImageOps
 
 
 # ============================================================
-# KONFIGURASI DEFAULT
+# CONFIG
 # ============================================================
 
 DEFAULT_TOP_PCT = 0.72
@@ -65,7 +61,7 @@ DEFAULT_FEATHER_PX = 3
 
 
 # ============================================================
-# CLOUDFLARE WORKERS AI
+# CLOUDFLARE
 # ============================================================
 
 CLOUDFLARE_MODEL = (
@@ -73,29 +69,33 @@ CLOUDFLARE_MODEL = (
 )
 
 DEFAULT_CF_PROMPT = (
-    "A realistic continuation of the original photograph background. "
-    "Naturally reconstruct the area where the camera timestamp overlay "
-    "was removed. Preserve the original floor, wall, objects, lighting, "
-    "shadows, colors, perspective, texture and photographic details. "
-    "Do not add text, numbers, signs, logos or new objects."
+    "Photorealistic continuation of the original photograph. "
+    "Reconstruct only the masked area naturally using the "
+    "surrounding background. Preserve the exact original "
+    "objects, floor, wall, furniture, lighting, shadows, "
+    "perspective, colors, textures and photographic appearance. "
+    "The repaired area must blend seamlessly with the surrounding "
+    "pixels. Do not add or modify any object outside the masked "
+    "area. Do not generate text."
 )
 
 DEFAULT_CF_NEGATIVE_PROMPT = (
-    "text, timestamp, numbers, GPS coordinates, date, time, watermark, "
-    "logo, letters, characters, blur, smudge, artifacts, duplicated "
-    "objects, distorted objects, unrealistic texture"
+    "text, letters, numbers, timestamp, GPS, coordinates, "
+    "date, time, watermark, logo, writing, sign, caption, "
+    "blur, smudge, artifacts, duplicated objects, distorted "
+    "objects, new objects, unrealistic texture"
 )
 
 CF_MAX_RETRIES = 3
-CF_RETRY_BACKOFF_SEC = 2.0
+CF_RETRY_BACKOFF_SEC = 2
 
 
 # ============================================================
-# PAGE CONFIG
+# PAGE
 # ============================================================
 
 st.set_page_config(
-    page_title="Timestamp Remover",
+    page_title="Timestamp Remover V5",
     page_icon="🧹",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -108,23 +108,19 @@ st.set_page_config(
 
 def load_pil_image_fixed_orientation(file_bytes):
 
-    pil_image = Image.open(
+    image = Image.open(
         io.BytesIO(file_bytes)
     )
 
-    pil_image = ImageOps.exif_transpose(
-        pil_image
+    image = ImageOps.exif_transpose(
+        image
     )
 
-    pil_image = pil_image.convert(
-        "RGB"
-    )
-
-    return pil_image
+    return image.convert("RGB")
 
 
 # ============================================================
-# TIMESTAMP DETECTOR
+# DETECT TIMESTAMP MASK
 # ============================================================
 
 def detect_timestamp_mask(
@@ -140,21 +136,10 @@ def detect_timestamp_mask(
 
     height, width = image_bgr.shape[:2]
 
-    top = int(
-        height * top_pct
-    )
-
-    bottom = int(
-        height * bottom_pct
-    )
-
-    left = int(
-        width * left_pct
-    )
-
-    right = int(
-        width * right_pct
-    )
+    top = int(height * top_pct)
+    bottom = int(height * bottom_pct)
+    left = int(width * left_pct)
+    right = int(width * right_pct)
 
     roi = image_bgr[
         top:bottom,
@@ -167,10 +152,6 @@ def detect_timestamp_mask(
             (height, width),
             dtype=np.uint8
         )
-
-    # --------------------------------------------------------
-    # GRAYSCALE
-    # --------------------------------------------------------
 
     gray = cv2.cvtColor(
         roi,
@@ -218,7 +199,7 @@ def detect_timestamp_mask(
     )
 
     # --------------------------------------------------------
-    # CONNECT WHITE TEXT WITH EDGE
+    # CONNECT WHITE TEXT + EDGE
     # --------------------------------------------------------
 
     edge_dilated = cv2.dilate(
@@ -236,7 +217,7 @@ def detect_timestamp_mask(
     )
 
     # --------------------------------------------------------
-    # BLACK OUTLINE
+    # OUTLINE
     # --------------------------------------------------------
 
     text_dilated = cv2.dilate(
@@ -259,7 +240,7 @@ def detect_timestamp_mask(
     )
 
     # --------------------------------------------------------
-    # CLOSE GAP
+    # CLOSE
     # --------------------------------------------------------
 
     combined_mask = cv2.morphologyEx(
@@ -323,7 +304,7 @@ def detect_timestamp_mask(
             ] = 255
 
     # --------------------------------------------------------
-    # FULL SIZE MASK
+    # FULL MASK
     # --------------------------------------------------------
 
     full_mask = np.zeros(
@@ -340,7 +321,7 @@ def detect_timestamp_mask(
 
 
 # ============================================================
-# CLASSIC INPAINT
+# CLASSIC FAST
 # ============================================================
 
 def reconstruct_fast(
@@ -387,19 +368,13 @@ def reconstruct_smooth(
 
         img_small = cv2.resize(
             result,
-            (
-                small_w,
-                small_h
-            ),
+            (small_w, small_h),
             interpolation=cv2.INTER_AREA
         )
 
         mask_small = cv2.resize(
             mask,
-            (
-                small_w,
-                small_h
-            ),
+            (small_w, small_h),
             interpolation=cv2.INTER_NEAREST
         )
 
@@ -414,13 +389,11 @@ def reconstruct_smooth(
 
             continue
 
-        if scale < 1.0:
-
-            method = cv2.INPAINT_NS
-
-        else:
-
-            method = cv2.INPAINT_TELEA
+        method = (
+            cv2.INPAINT_NS
+            if scale < 1.0
+            else cv2.INPAINT_TELEA
+        )
 
         inpainted_small = cv2.inpaint(
             img_small,
@@ -431,10 +404,7 @@ def reconstruct_smooth(
 
         inpainted_up = cv2.resize(
             inpainted_small,
-            (
-                width,
-                height
-            ),
+            (width, height),
             interpolation=cv2.INTER_CUBIC
         )
 
@@ -480,169 +450,138 @@ def reconstruct_smooth(
 def remove_timestamp_classic(
     image_bgr,
     top_pct=DEFAULT_TOP_PCT,
-    left_pct=DEFAULT_LEFT_PCT,
-    right_pct=DEFAULT_RIGHT_PCT,
-    bottom_pct=DEFAULT_BOTTOM_PCT,
     white_thresh=DEFAULT_WHITE_THRESH,
     edge_thresh=DEFAULT_EDGE_THRESH,
     dilate_px=DEFAULT_DILATE_PX,
     inpaint_radius=DEFAULT_INPAINT_RADIUS,
-    smooth_mode=DEFAULT_SMOOTH_MODE,
+    smooth_mode=True,
     feather_px=DEFAULT_FEATHER_PX,
 ):
 
-    full_mask = detect_timestamp_mask(
+    mask = detect_timestamp_mask(
         image_bgr=image_bgr,
         top_pct=top_pct,
-        left_pct=left_pct,
-        right_pct=right_pct,
-        bottom_pct=bottom_pct,
         white_thresh=white_thresh,
         edge_thresh=edge_thresh,
         dilate_px=dilate_px,
     )
 
     detected_px = int(
-        np.count_nonzero(
-            full_mask
-        )
+        np.count_nonzero(mask)
     )
 
     if detected_px == 0:
 
         return (
             image_bgr.copy(),
-            full_mask,
-            detected_px
+            mask,
+            0
         )
 
     if smooth_mode:
 
-        reconstructed = reconstruct_smooth(
+        result = reconstruct_smooth(
             image_bgr,
-            full_mask,
+            mask,
             inpaint_radius=inpaint_radius,
             feather_px=feather_px
         )
 
     else:
 
-        reconstructed = reconstruct_fast(
+        result = reconstruct_fast(
             image_bgr,
-            full_mask,
+            mask,
             inpaint_radius=inpaint_radius
         )
 
     return (
-        reconstructed,
-        full_mask,
+        result,
+        mask,
         detected_px
     )
 
 
 # ============================================================
-# CLOUDFLARE IMAGE ENCODING
+# RESIZE FOR CLOUDFLARE
 # ============================================================
 
-def pil_to_base64(
-    pil_image,
-    image_format="PNG"
-):
-
-    buffer = io.BytesIO()
-
-    pil_image.save(
-        buffer,
-        format=image_format
-    )
-
-    return base64.b64encode(
-        buffer.getvalue()
-    ).decode("utf-8")
-
-
-# ============================================================
-# CLOUDFLARE AI INPAINTING
-# ============================================================
-
-def call_cloudflare_inpainting(
+def prepare_ai_image(
     pil_image,
     mask,
-    account_id,
-    api_token,
-    prompt=DEFAULT_CF_PROMPT,
-    negative_prompt=DEFAULT_CF_NEGATIVE_PROMPT,
-    num_steps=20,
-    strength=1.0,
-    guidance=7.5,
+    max_dimension=1024
 ):
-
-    if not account_id:
-
-        return (
-            None,
-            "Cloudflare Account ID belum diisi."
-        )
-
-    if not api_token:
-
-        return (
-            None,
-            "Cloudflare API Token belum diisi."
-        )
 
     original_size = pil_image.size
 
+    image = pil_image.copy()
+
     # --------------------------------------------------------
-    # WORKING IMAGE
+    # Resize
     # --------------------------------------------------------
 
-    working_image = pil_image.copy()
-
-    max_dimension = 1024
-
-    if max(
-        working_image.size
-    ) > max_dimension:
+    if max(image.size) > max_dimension:
 
         scale = (
-            max_dimension
-            /
-            max(working_image.size)
+            max_dimension /
+            max(image.size)
         )
 
-        new_size = (
-            max(
-                1,
-                int(
-                    working_image.width
-                    * scale
-                )
-            ),
-            max(
-                1,
-                int(
-                    working_image.height
-                    * scale
-                )
-            ),
+        new_width = max(
+            256,
+            int(image.width * scale)
         )
 
-        working_image = working_image.resize(
-            new_size,
+        new_height = max(
+            256,
+            int(image.height * scale)
+        )
+
+        image = image.resize(
+            (
+                new_width,
+                new_height
+            ),
             Image.Resampling.LANCZOS
         )
 
     # --------------------------------------------------------
-    # MASK
+    # Ensure dimensions valid
+    # --------------------------------------------------------
+
+    width, height = image.size
+
+    width = min(
+        2048,
+        max(256, width)
+    )
+
+    height = min(
+        2048,
+        max(256, height)
+    )
+
+    if image.size != (
+        width,
+        height
+    ):
+
+        image = image.resize(
+            (width, height),
+            Image.Resampling.LANCZOS
+        )
+
+    # --------------------------------------------------------
+    # Mask
     # --------------------------------------------------------
 
     mask_pil = Image.fromarray(
-        mask.astype(np.uint8)
+        mask.astype(np.uint8),
+        mode="L"
     )
 
     mask_pil = mask_pil.resize(
-        working_image.size,
+        (width, height),
         Image.Resampling.NEAREST
     )
 
@@ -651,29 +590,139 @@ def call_cloudflare_inpainting(
         255 if p > 127 else 0
     )
 
-    # --------------------------------------------------------
-    # IMAGE BASE64
-    # --------------------------------------------------------
-
-    image_b64 = pil_to_base64(
-        working_image,
-        "PNG"
-    )
-
-    # --------------------------------------------------------
-    # MASK BASE64
-    #
-    # Kita kirim mask sebagai PNG juga.
-    # --------------------------------------------------------
-
-    mask_b64 = pil_to_base64(
+    return (
+        image,
         mask_pil,
-        "PNG"
+        original_size
     )
 
-    # --------------------------------------------------------
-    # CLOUDFLARE ENDPOINT
-    # --------------------------------------------------------
+
+# ============================================================
+# PIL -> UINT8 ARRAY
+# ============================================================
+
+def image_to_uint8_array(
+    pil_image
+):
+
+    rgb = np.array(
+        pil_image.convert("RGB"),
+        dtype=np.uint8
+    )
+
+    return rgb.flatten().tolist()
+
+
+def mask_to_uint8_array(
+    mask_pil
+):
+
+    mask = np.array(
+        mask_pil.convert("L"),
+        dtype=np.uint8
+    )
+
+    return mask.flatten().tolist()
+
+
+# ============================================================
+# CLOUDFLARE INPAINTING
+# ============================================================
+
+def call_cloudflare_inpainting(
+    pil_image,
+    mask,
+    account_id,
+    api_token,
+    prompt,
+    negative_prompt,
+    num_steps,
+    strength,
+    guidance,
+):
+
+    if not account_id:
+
+        return (
+            None,
+            "Cloudflare Account ID kosong."
+        )
+
+    if not api_token:
+
+        return (
+            None,
+            "Cloudflare API Token kosong."
+        )
+
+    # ========================================================
+    # PREPARE
+    # ========================================================
+
+    (
+        working_image,
+        working_mask,
+        original_size
+    ) = prepare_ai_image(
+        pil_image,
+        mask
+    )
+
+    width, height = (
+        working_image.size
+    )
+
+    # ========================================================
+    # ARRAY
+    # ========================================================
+
+    image_array = (
+        image_to_uint8_array(
+            working_image
+        )
+    )
+
+    mask_array = (
+        mask_to_uint8_array(
+            working_mask
+        )
+    )
+
+    # ========================================================
+    # VALIDATION
+    # ========================================================
+
+    expected_pixels = (
+        width * height
+    )
+
+    expected_image_values = (
+        expected_pixels * 3
+    )
+
+    if len(image_array) != (
+        expected_image_values
+    ):
+
+        return (
+            None,
+            "Ukuran image array tidak "
+            "sesuai dengan width/height."
+        )
+
+    if len(mask_array) != (
+        expected_pixels
+    ):
+
+        return (
+            None,
+            "Ukuran mask array tidak "
+            "sesuai dengan width/height."
+        )
+
+    # ========================================================
+    # ENDPOINT
+    # ========================================================
 
     url = (
         "https://api.cloudflare.com/client/v4/"
@@ -682,27 +731,72 @@ def call_cloudflare_inpainting(
     )
 
     headers = {
-        "Authorization": (
-            f"Bearer {api_token}"
-        ),
-        "Content-Type": "application/json",
+        "Authorization":
+            f"Bearer {api_token}",
+
+        "Content-Type":
+            "application/json",
     }
+
+    # ========================================================
+    # PAYLOAD
+    # ========================================================
+    #
+    # IMPORTANT:
+    # Cloudflare schema:
+    #
+    # image = uint8 array
+    # mask  = uint8 array
+    #
+    # BUKAN mask_b64.
+    #
+    # ========================================================
 
     payload = {
         "prompt": prompt,
-        "negative_prompt": negative_prompt,
-        "image_b64": image_b64,
-        "mask_b64": mask_b64,
-        "num_steps": int(num_steps),
-        "strength": float(strength),
-        "guidance": float(guidance),
+
+        "negative_prompt":
+            negative_prompt,
+
+        "image":
+            image_array,
+
+        "mask":
+            mask_array,
+
+        "width":
+            width,
+
+        "height":
+            height,
+
+        "num_steps":
+            min(
+                20,
+                max(
+                    1,
+                    int(num_steps)
+                )
+            ),
+
+        "strength":
+            min(
+                1.0,
+                max(
+                    0.0,
+                    float(strength)
+                )
+            ),
+
+        "guidance":
+            float(guidance),
     }
 
-    last_error = None
+    # ========================================================
+    # REQUEST
+    # ========================================================
 
-    # ========================================================
-    # RETRY
-    # ========================================================
+    last_error = None
 
     for attempt in range(
         1,
@@ -715,34 +809,34 @@ def call_cloudflare_inpainting(
                 url,
                 headers=headers,
                 json=payload,
-                timeout=180
+                timeout=300
             )
 
-            # ------------------------------------------------
-            # ERROR
-            # ------------------------------------------------
+            # =================================================
+            # HTTP ERROR
+            # =================================================
 
             if response.status_code != 200:
 
                 try:
 
-                    error_json = (
-                        response.json()
-                    )
-
-                    last_error = (
-                        f"HTTP {response.status_code}: "
-                        f"{error_json}"
-                    )
+                    data = response.json()
 
                 except Exception:
 
-                    last_error = (
-                        f"HTTP {response.status_code}: "
-                        f"{response.text[:1000]}"
-                    )
+                    data = response.text[
+                        :2000
+                    ]
 
-                if attempt < CF_MAX_RETRIES:
+                last_error = (
+                    f"HTTP "
+                    f"{response.status_code}: "
+                    f"{data}"
+                )
+
+                if attempt < (
+                    CF_MAX_RETRIES
+                ):
 
                     time.sleep(
                         CF_RETRY_BACKOFF_SEC
@@ -756,172 +850,181 @@ def call_cloudflare_inpainting(
                     last_error
                 )
 
-            # ------------------------------------------------
-            # RESPONSE IMAGE
-            # ------------------------------------------------
+            # =================================================
+            # IMAGE RESPONSE
+            # =================================================
 
             content_type = (
-                response.headers.get(
+                response.headers
+                .get(
                     "content-type",
                     ""
-                ).lower()
+                )
+                .lower()
             )
 
             if content_type.startswith(
                 "image/"
             ):
 
-                result_image = Image.open(
+                result = Image.open(
                     io.BytesIO(
                         response.content
                     )
                 ).convert("RGB")
 
-                if (
-                    result_image.size
-                    != original_size
+                if result.size != (
+                    width,
+                    height
                 ):
 
-                    result_image = (
-                        result_image.resize(
-                            original_size,
-                            Image.Resampling.LANCZOS
-                        )
+                    result = result.resize(
+                        (
+                            width,
+                            height
+                        ),
+                        Image.Resampling.LANCZOS
+                    )
+
+                # ---------------------------------------------
+                # BACK TO ORIGINAL SIZE
+                # ---------------------------------------------
+
+                if result.size != (
+                    original_size
+                ):
+
+                    result = result.resize(
+                        original_size,
+                        Image.Resampling.LANCZOS
                     )
 
                 return (
-                    result_image,
+                    result,
                     None
                 )
 
-            # ------------------------------------------------
-            # RESPONSE JSON
-            # ------------------------------------------------
+            # =================================================
+            # JSON RESPONSE
+            # =================================================
 
             try:
 
-                response_json = (
-                    response.json()
-                )
+                data = response.json()
 
             except Exception:
 
                 return (
                     None,
-                    "Cloudflare mengembalikan "
-                    "response bukan image/JSON."
+                    "Cloudflare HTTP 200 "
+                    "tetapi response bukan "
+                    "image atau JSON."
                 )
 
-            if not response_json.get(
+            if not data.get(
                 "success",
                 True
             ):
 
                 return (
                     None,
-                    str(response_json)
+                    str(data)
                 )
 
-            result = response_json.get(
+            result_data = data.get(
                 "result"
             )
 
-            # ------------------------------------------------
+            # -------------------------------------------------
             # RESULT STRING
-            # ------------------------------------------------
+            # -------------------------------------------------
 
             if isinstance(
-                result,
+                result_data,
                 str
             ):
 
                 try:
 
-                    image_bytes = (
+                    import base64
+
+                    decoded = (
                         base64.b64decode(
-                            result
+                            result_data
                         )
                     )
 
-                    result_image = Image.open(
+                    result = Image.open(
                         io.BytesIO(
-                            image_bytes
+                            decoded
                         )
-                    ).convert("RGB")
+                    ).convert(
+                        "RGB"
+                    )
 
-                    if (
-                        result_image.size
-                        != original_size
-                    ):
-
-                        result_image = (
-                            result_image.resize(
-                                original_size,
-                                Image.Resampling.LANCZOS
-                            )
-                        )
+                    result = result.resize(
+                        original_size,
+                        Image.Resampling.LANCZOS
+                    )
 
                     return (
-                        result_image,
+                        result,
                         None
                     )
 
                 except Exception:
                     pass
 
-            # ------------------------------------------------
-            # RESULT OBJECT
-            # ------------------------------------------------
+            # -------------------------------------------------
+            # RESULT DICT
+            # -------------------------------------------------
 
             if isinstance(
-                result,
+                result_data,
                 dict
             ):
 
-                possible_data = (
-                    result.get(
+                possible = (
+                    result_data.get(
                         "image"
                     )
-                    or result.get(
+                    or
+                    result_data.get(
                         "image_b64"
                     )
-                    or result.get(
+                    or
+                    result_data.get(
                         "response"
                     )
                 )
 
-                if possible_data:
+                if possible:
 
                     try:
 
-                        image_bytes = (
+                        import base64
+
+                        decoded = (
                             base64.b64decode(
-                                possible_data
+                                possible
                             )
                         )
 
-                        result_image = (
-                            Image.open(
-                                io.BytesIO(
-                                    image_bytes
-                                )
-                            ).convert("RGB")
+                        result = Image.open(
+                            io.BytesIO(
+                                decoded
+                            )
+                        ).convert(
+                            "RGB"
                         )
 
-                        if (
-                            result_image.size
-                            != original_size
-                        ):
-
-                            result_image = (
-                                result_image.resize(
-                                    original_size,
-                                    Image.Resampling.LANCZOS
-                                )
-                            )
+                        result = result.resize(
+                            original_size,
+                            Image.Resampling.LANCZOS
+                        )
 
                         return (
-                            result_image,
+                            result,
                             None
                         )
 
@@ -930,9 +1033,24 @@ def call_cloudflare_inpainting(
 
             return (
                 None,
-                "Format hasil image Cloudflare "
-                "tidak dikenali.\n\n"
-                f"Response: {response_json}"
+                "Cloudflare berhasil "
+                "memproses request tetapi "
+                "format hasil gambar tidak "
+                "dikenali.\n\n"
+                f"{data}"
+            )
+
+        except requests.exceptions.Timeout:
+
+            last_error = (
+                "Request ke Cloudflare "
+                "timeout."
+            )
+
+        except requests.exceptions.RequestException as error:
+
+            last_error = (
+                f"Request error: {error}"
             )
 
         except Exception as error:
@@ -941,12 +1059,14 @@ def call_cloudflare_inpainting(
                 error
             )
 
-            if attempt < CF_MAX_RETRIES:
+        if attempt < (
+            CF_MAX_RETRIES
+        ):
 
-                time.sleep(
-                    CF_RETRY_BACKOFF_SEC
-                    * attempt
-                )
+            time.sleep(
+                CF_RETRY_BACKOFF_SEC
+                * attempt
+            )
 
     return (
         None,
@@ -955,20 +1075,49 @@ def call_cloudflare_inpainting(
 
 
 # ============================================================
-# IMAGE ENCODER
+# ENCODER
 # ============================================================
 
-def encode_image_bytes_from_bgr(
+def encode_pil_image(
+    image,
+    ext
+):
+
+    buffer = io.BytesIO()
+
+    if ext.lower() in (
+        ".jpg",
+        ".jpeg"
+    ):
+
+        image.save(
+            buffer,
+            format="JPEG",
+            quality=95,
+            optimize=True
+        )
+
+    else:
+
+        image.save(
+            buffer,
+            format="PNG"
+        )
+
+    return buffer.getvalue()
+
+
+def encode_bgr_image(
     image_bgr,
     ext
 ):
 
-    if ext.lower() in [
+    if ext.lower() in (
         ".jpg",
         ".jpeg"
-    ]:
+    ):
 
-        ok, buf = cv2.imencode(
+        ok, buffer = cv2.imencode(
             ".jpg",
             image_bgr,
             [
@@ -979,48 +1128,22 @@ def encode_image_bytes_from_bgr(
 
     else:
 
-        ok, buf = cv2.imencode(
+        ok, buffer = cv2.imencode(
             ".png",
             image_bgr
         )
 
     if not ok:
 
-        return None
-
-    return buf.tobytes()
-
-
-def encode_image_bytes_from_pil(
-    pil_image,
-    ext
-):
-
-    buffer = io.BytesIO()
-
-    if ext.lower() in [
-        ".jpg",
-        ".jpeg"
-    ]:
-
-        pil_image.save(
-            buffer,
-            format="JPEG",
-            quality=95
+        raise ValueError(
+            "Gagal encode image."
         )
 
-    else:
-
-        pil_image.save(
-            buffer,
-            format="PNG"
-        )
-
-    return buffer.getvalue()
+    return buffer.tobytes()
 
 
 # ============================================================
-# SUPPORTED IMAGE
+# FILE EXTENSIONS
 # ============================================================
 
 IMAGE_EXTS = (
@@ -1031,126 +1154,117 @@ IMAGE_EXTS = (
 
 
 # ============================================================
-# COLLECT INPUT FILES
+# COLLECT FILES
 # ============================================================
 
 def collect_input_files(
     uploaded_files
 ):
 
-    collected = []
+    files = []
 
     for uploaded in uploaded_files:
 
-        name_lower = (
-            uploaded.name.lower()
-        )
+        filename = uploaded.name
 
         # ====================================================
         # ZIP
         # ====================================================
 
-        if name_lower.endswith(
+        if filename.lower().endswith(
             ".zip"
         ):
 
-            with zipfile.ZipFile(
-                uploaded
-            ) as zip_file:
+            try:
 
-                for zip_info in (
-                    zip_file.infolist()
-                ):
+                with zipfile.ZipFile(
+                    uploaded
+                ) as archive:
 
-                    if zip_info.is_dir():
-                        continue
+                    for info in (
+                        archive.infolist()
+                    ):
 
-                    inner_name = (
-                        zip_info.filename
-                    )
+                        if info.is_dir():
+                            continue
 
-                    if (
-                        not inner_name
-                        .lower()
-                        .endswith(
+                        path = info.filename
+
+                        if (
+                            "__MACOSX"
+                            in path
+                        ):
+                            continue
+
+                        if not path.lower().endswith(
                             IMAGE_EXTS
-                        )
-                    ):
+                        ):
+                            continue
 
-                        continue
+                        with archive.open(
+                            info
+                        ) as file:
 
-                    if (
-                        "__MACOSX"
-                        in inner_name
-                    ):
+                            data = file.read()
 
-                        continue
-
-                    # ----------------------------------------
-                    # JANGAN basename()
-                    #
-                    # Struktur folder dipertahankan.
-                    # ----------------------------------------
-
-                    with zip_file.open(
-                        zip_info
-                    ) as inner_file:
-
-                        collected.append(
+                        files.append(
                             {
-                                "path": inner_name,
-                                "bytes": (
-                                    inner_file.read()
-                                ),
-                                "source_type": "zip",
+                                "path": path,
+                                "bytes": data,
+                                "source": "zip",
                             }
                         )
 
+            except zipfile.BadZipFile:
+
+                st.error(
+                    f"❌ `{filename}` "
+                    "bukan ZIP yang valid."
+                )
+
         # ====================================================
-        # FOTO LANGSUNG
+        # IMAGE
         # ====================================================
 
-        elif name_lower.endswith(
+        elif filename.lower().endswith(
             IMAGE_EXTS
         ):
 
-            collected.append(
+            files.append(
                 {
-                    "path": uploaded.name,
-                    "bytes": (
-                        uploaded.getvalue()
-                    ),
-                    "source_type": "photo",
+                    "path": filename,
+                    "bytes": uploaded.getvalue(),
+                    "source": "single",
                 }
             )
 
-    return collected
+    return files
 
 
 # ============================================================
-# ZIP OUTPUT
+# CREATE ZIP
 # ============================================================
 
 def create_output_zip(
     results
 ):
 
-    zip_buffer = io.BytesIO()
+    buffer = io.BytesIO()
 
     with zipfile.ZipFile(
-        zip_buffer,
+        buffer,
         "w",
-        zipfile.ZIP_DEFLATED
-    ) as zip_out:
+        compression=zipfile.ZIP_DEFLATED
+    ) as archive:
 
         for result in results:
 
-            zip_out.writestr(
+            archive.writestr(
                 result["output_path"],
                 result["encoded_bytes"]
             )
 
-    return zip_buffer.getvalue()
+    return buffer.getvalue()
 
 
 # ============================================================
@@ -1164,10 +1278,10 @@ with st.sidebar:
     )
 
     method = st.radio(
-        "Pilih metode",
-        options=[
-            "Klasik (Offline)",
+        "Pilih metode:",
+        [
             "AI - Cloudflare Workers AI",
+            "Klasik - OpenCV",
         ],
         index=0,
     )
@@ -1177,7 +1291,7 @@ with st.sidebar:
     )
 
     # ========================================================
-    # CLOUDFLARE SETTINGS
+    # CLOUDFLARE
     # ========================================================
 
     if use_ai:
@@ -1186,26 +1300,22 @@ with st.sidebar:
             "### ☁️ Cloudflare"
         )
 
-        cloudflare_account_id = (
-            st.text_input(
-                "Cloudflare Account ID",
-                value=os.environ.get(
-                    "CLOUDFLARE_ACCOUNT_ID",
-                    ""
-                ),
-                type="password",
-            )
+        account_id = st.text_input(
+            "Account ID",
+            value=os.environ.get(
+                "CLOUDFLARE_ACCOUNT_ID",
+                ""
+            ),
+            type="password"
         )
 
-        cloudflare_api_token = (
-            st.text_input(
-                "Cloudflare API Token",
-                value=os.environ.get(
-                    "CLOUDFLARE_API_TOKEN",
-                    ""
-                ),
-                type="password",
-            )
+        api_token = st.text_input(
+            "API Token",
+            value=os.environ.get(
+                "CLOUDFLARE_API_TOKEN",
+                ""
+            ),
+            type="password"
         )
 
         st.caption(
@@ -1213,145 +1323,144 @@ with st.sidebar:
         )
 
         st.markdown(
-            "### ✨ AI Settings"
+            "### ⚙️ AI"
         )
 
-        cloudflare_steps = st.slider(
-            "AI Steps",
-            min_value=10,
-            max_value=30,
-            value=20,
-            step=1,
+        ai_steps = st.slider(
+            "Steps",
+            5,
+            20,
+            20,
+            1
         )
 
-        cloudflare_strength = st.slider(
-            "AI Strength",
-            min_value=0.1,
-            max_value=1.0,
-            value=1.0,
-            step=0.05,
+        ai_strength = st.slider(
+            "Strength",
+            0.0,
+            1.0,
+            1.0,
+            0.05
         )
 
-        cloudflare_guidance = st.slider(
-            "AI Guidance",
-            min_value=1.0,
-            max_value=15.0,
-            value=7.5,
-            step=0.5,
+        ai_guidance = st.slider(
+            "Guidance",
+            1.0,
+            15.0,
+            7.5,
+            0.5
         )
 
         with st.expander(
-            "✏️ Prompt AI"
+            "📝 Prompt AI"
         ):
 
-            cloudflare_prompt = (
-                st.text_area(
-                    "Prompt",
-                    value=DEFAULT_CF_PROMPT,
-                    height=150,
-                )
+            ai_prompt = st.text_area(
+                "Prompt",
+                value=DEFAULT_CF_PROMPT,
+                height=180
             )
 
-            cloudflare_negative_prompt = (
+            ai_negative_prompt = (
                 st.text_area(
                     "Negative Prompt",
                     value=(
                         DEFAULT_CF_NEGATIVE_PROMPT
                     ),
-                    height=120,
+                    height=140
                 )
             )
 
     else:
 
-        cloudflare_account_id = None
-        cloudflare_api_token = None
+        account_id = ""
+        api_token = ""
 
-        cloudflare_prompt = (
-            DEFAULT_CF_PROMPT
-        )
+        ai_steps = 20
+        ai_strength = 1.0
+        ai_guidance = 7.5
 
-        cloudflare_negative_prompt = (
+        ai_prompt = DEFAULT_CF_PROMPT
+        ai_negative_prompt = (
             DEFAULT_CF_NEGATIVE_PROMPT
         )
 
-        cloudflare_steps = 20
-        cloudflare_strength = 1.0
-        cloudflare_guidance = 7.5
-
     # ========================================================
-    # CLASSIC SETTINGS
+    # DETECTION
     # ========================================================
 
     st.markdown(
-        "### ⚙️ Parameter Deteksi"
+        "### 🔍 Deteksi Timestamp"
     )
 
     top_pct = (
         st.slider(
-            "Mulai area deteksi (% tinggi foto)",
-            min_value=40,
-            max_value=95,
-            value=int(
+            "Mulai deteksi dari (%)",
+            40,
+            95,
+            int(
                 DEFAULT_TOP_PCT * 100
             ),
-            step=1,
+            1
         )
         / 100.0
     )
 
     white_thresh = st.slider(
         "White Threshold",
-        min_value=140,
-        max_value=250,
-        value=DEFAULT_WHITE_THRESH,
-        step=5,
+        140,
+        250,
+        DEFAULT_WHITE_THRESH,
+        5
     )
 
     edge_thresh = st.slider(
         "Edge Threshold",
-        min_value=5,
-        max_value=80,
-        value=DEFAULT_EDGE_THRESH,
-        step=5,
+        5,
+        80,
+        DEFAULT_EDGE_THRESH,
+        5
     )
 
     dilate_px = st.slider(
-        "Margin Timestamp (px)",
-        min_value=1,
-        max_value=20,
-        value=DEFAULT_DILATE_PX,
-        step=1,
+        "Margin Mask (px)",
+        1,
+        20,
+        DEFAULT_DILATE_PX,
+        1
+    )
+
+    # ========================================================
+    # CLASSIC
+    # ========================================================
+
+    st.markdown(
+        "### 🛠️ Classic"
     )
 
     inpaint_radius = st.slider(
-        "Classic Inpaint Radius",
-        min_value=1,
-        max_value=15,
-        value=DEFAULT_INPAINT_RADIUS,
-        step=1,
+        "Inpaint Radius",
+        1,
+        15,
+        DEFAULT_INPAINT_RADIUS,
+        1
     )
 
     smooth_mode = st.checkbox(
-        "Mode Halus Classic",
-        value=DEFAULT_SMOOTH_MODE,
+        "Mode Halus",
+        DEFAULT_SMOOTH_MODE
     )
 
-    feather_px = DEFAULT_FEATHER_PX
+    feather_px = st.slider(
+        "Feather",
+        0,
+        10,
+        DEFAULT_FEATHER_PX,
+        1
+    )
 
-    if smooth_mode:
-
-        feather_px = st.slider(
-            "Feather",
-            min_value=0,
-            max_value=10,
-            value=DEFAULT_FEATHER_PX,
-            step=1,
-        )
-
-    show_mask_preview = st.checkbox(
-        "Tampilkan preview mask",
-        value=True,
+    show_mask = st.checkbox(
+        "Tampilkan Mask",
+        True
     )
 
 
@@ -1359,14 +1468,13 @@ with st.sidebar:
 # HEADER
 # ============================================================
 
-st.markdown(
-    "# 🧹 Timestamp Remover"
+st.title(
+    "🧹 Timestamp Remover V5"
 )
 
 st.caption(
-    "Hapus timestamp GPS Map Camera dari foto "
-    "menggunakan Classic Inpainting atau "
-    "Cloudflare Workers AI."
+    "Hapus timestamp GPS Camera secara otomatis "
+    "dengan Cloudflare Workers AI atau OpenCV."
 )
 
 
@@ -1375,32 +1483,28 @@ st.caption(
 # ============================================================
 
 st.markdown(
-    "## 1️⃣ Upload"
+    "## 1️⃣ Upload Foto / ZIP"
 )
 
 uploaded_files = st.file_uploader(
-    "Upload JPG / JPEG / PNG atau ZIP",
+    "Upload JPG, JPEG, PNG atau ZIP",
     type=[
         "jpg",
         "jpeg",
         "png",
-        "zip",
+        "zip"
     ],
-    accept_multiple_files=True,
+    accept_multiple_files=True
 )
 
 if not uploaded_files:
 
     st.info(
-        "📷 Silakan upload foto atau ZIP."
+        "📷 Upload foto atau ZIP untuk mulai."
     )
 
     st.stop()
 
-
-# ============================================================
-# COLLECT
-# ============================================================
 
 input_files = (
     collect_input_files(
@@ -1411,33 +1515,33 @@ input_files = (
 if not input_files:
 
     st.warning(
-        "Tidak ditemukan foto."
+        "Tidak ada foto yang ditemukan."
     )
 
     st.stop()
 
 
 st.success(
-    f"✅ {len(input_files)} foto siap diproses."
+    f"✅ {len(input_files)} foto ditemukan."
 )
 
 
 # ============================================================
-# VALIDATE CLOUDFLARE
+# VALIDATION
 # ============================================================
 
 if use_ai:
 
-    if not cloudflare_account_id:
+    if not account_id:
 
         st.warning(
-            "⚠️ Cloudflare Account ID belum diisi."
+            "⚠️ Isi Cloudflare Account ID."
         )
 
-    if not cloudflare_api_token:
+    if not api_token:
 
         st.warning(
-            "⚠️ Cloudflare API Token belum diisi."
+            "⚠️ Isi Cloudflare API Token."
         )
 
 
@@ -1449,19 +1553,19 @@ st.markdown(
     "## 2️⃣ Proses"
 )
 
-process_disabled = (
+disabled = (
     use_ai
     and (
-        not cloudflare_account_id
-        or not cloudflare_api_token
+        not account_id
+        or not api_token
     )
 )
 
-process_clicked = st.button(
+start = st.button(
     "🚀 HAPUS TIMESTAMP",
     type="primary",
     use_container_width=True,
-    disabled=process_disabled,
+    disabled=disabled
 )
 
 
@@ -1469,15 +1573,15 @@ process_clicked = st.button(
 # PROCESS
 # ============================================================
 
-if process_clicked:
+if start:
 
     results = []
 
-    progress_bar = st.progress(
+    progress = st.progress(
         0.0
     )
 
-    status_text = st.empty()
+    status = st.empty()
 
     total = len(
         input_files
@@ -1495,16 +1599,17 @@ if process_clicked:
             "bytes"
         ]
 
-        status_text.caption(
-            f"Memproses `{input_path}` "
-            f"({index + 1}/{total})..."
+        status.write(
+            f"⏳ Memproses "
+            f"`{input_path}` "
+            f"({index + 1}/{total})"
         )
 
         try:
 
-            # ----------------------------------------------
+            # =================================================
             # LOAD
-            # ----------------------------------------------
+            # =================================================
 
             pil_image = (
                 load_pil_image_fixed_orientation(
@@ -1512,10 +1617,8 @@ if process_clicked:
                 )
             )
 
-            name, ext = (
-                os.path.splitext(
-                    input_path
-                )
+            name, ext = os.path.splitext(
+                input_path
             )
 
             if not ext:
@@ -1523,80 +1626,65 @@ if process_clicked:
                 ext = ".jpg"
 
             # =================================================
-            # MODE AI
+            # IMAGE NUMPY
+            # =================================================
+
+            image_rgb = np.array(
+                pil_image
+            )
+
+            image_bgr = cv2.cvtColor(
+                image_rgb,
+                cv2.COLOR_RGB2BGR
+            )
+
+            # =================================================
+            # DETECT MASK
+            # =================================================
+
+            mask = detect_timestamp_mask(
+                image_bgr=image_bgr,
+                top_pct=top_pct,
+                white_thresh=white_thresh,
+                edge_thresh=edge_thresh,
+                dilate_px=dilate_px
+            )
+
+            detected_px = int(
+                np.count_nonzero(
+                    mask
+                )
+            )
+
+            if detected_px == 0:
+
+                st.warning(
+                    f"⚠️ Timestamp tidak "
+                    f"terdeteksi pada "
+                    f"`{input_path}`"
+                )
+
+                continue
+
+            # =================================================
+            # AI
             # =================================================
 
             if use_ai:
-
-                image_rgb = np.array(
-                    pil_image
-                )
-
-                image_bgr = (
-                    cv2.cvtColor(
-                        image_rgb,
-                        cv2.COLOR_RGB2BGR
-                    )
-                )
-
-                # ----------------------------------------------
-                # DETECT MASK
-                # ----------------------------------------------
-
-                mask = (
-                    detect_timestamp_mask(
-                        image_bgr,
-                        top_pct=top_pct,
-                        white_thresh=white_thresh,
-                        edge_thresh=edge_thresh,
-                        dilate_px=dilate_px,
-                    )
-                )
-
-                detected_px = int(
-                    np.count_nonzero(
-                        mask
-                    )
-                )
-
-                if detected_px == 0:
-
-                    st.warning(
-                        f"⚠️ Timestamp tidak "
-                        f"terdeteksi: `{input_path}`"
-                    )
-
-                    continue
-
-                # ----------------------------------------------
-                # CLOUDFLARE
-                # ----------------------------------------------
 
                 result_pil, error = (
                     call_cloudflare_inpainting(
                         pil_image=pil_image,
                         mask=mask,
-                        account_id=(
-                            cloudflare_account_id
-                        ),
-                        api_token=(
-                            cloudflare_api_token
-                        ),
-                        prompt=(
-                            cloudflare_prompt
-                        ),
+                        account_id=account_id,
+                        api_token=api_token,
+                        prompt=ai_prompt,
                         negative_prompt=(
-                            cloudflare_negative_prompt
+                            ai_negative_prompt
                         ),
-                        num_steps=(
-                            cloudflare_steps
-                        ),
-                        strength=(
-                            cloudflare_strength
-                        ),
-                        guidance=(
-                            cloudflare_guidance
-                        ),
+                        num_steps=ai_steps,
+                        strength=ai_strength,
+                        guidance=ai_guidance,
                     )
                 )
 
@@ -1610,85 +1698,30 @@ if process_clicked:
 
                     continue
 
-                # ----------------------------------------------
-                # ENCODE
-                # ----------------------------------------------
+                result_rgb = np.array(
+                    result_pil
+                )
 
-                encoded_bytes = (
-                    encode_image_bytes_from_pil(
+                encoded = (
+                    encode_pil_image(
                         result_pil,
                         ext
                     )
                 )
 
-                results.append(
-                    {
-                        "filename": os.path.basename(
-                            input_path
-                        ),
-
-                        "input_path": input_path,
-
-                        # Struktur folder dipertahankan
-                        "output_path": input_path,
-
-                        "original_rgb": (
-                            image_rgb
-                        ),
-
-                        "result_rgb": (
-                            np.array(
-                                result_pil
-                            )
-                        ),
-
-                        "mask": mask,
-
-                        "detected_px": (
-                            detected_px
-                        ),
-
-                        "encoded_bytes": (
-                            encoded_bytes
-                        ),
-
-                        "mime": (
-                            "image/jpeg"
-                            if ext.lower()
-                            in [
-                                ".jpg",
-                                ".jpeg"
-                            ]
-                            else
-                            "image/png"
-                        ),
-
-                        "method": (
-                            "Cloudflare AI"
-                        ),
-                    }
+                method_name = (
+                    "Cloudflare AI"
                 )
 
             # =================================================
-            # MODE CLASSIC
+            # CLASSIC
             # =================================================
 
             else:
 
-                image_rgb = np.array(
-                    pil_image
-                )
-
-                image_bgr = (
-                    cv2.cvtColor(
-                        image_rgb,
-                        cv2.COLOR_RGB2BGR
-                    )
-                )
-
                 result_bgr, mask, detected_px = (
                     remove_timestamp_classic(
-                        image_bgr,
+                        image_bgr=image_bgr,
                         top_pct=top_pct,
                         white_thresh=white_thresh,
                         edge_thresh=edge_thresh,
@@ -1705,73 +1738,99 @@ if process_clicked:
                     )
                 )
 
-                encoded_bytes = (
-                    encode_image_bytes_from_bgr(
+                result_rgb = cv2.cvtColor(
+                    result_bgr,
+                    cv2.COLOR_BGR2RGB
+                )
+
+                result_pil = Image.fromarray(
+                    result_rgb
+                )
+
+                encoded = (
+                    encode_bgr_image(
                         result_bgr,
                         ext
                     )
                 )
 
-                results.append(
-                    {
-                        "filename": os.path.basename(
+                method_name = "Classic"
+
+            # =================================================
+            # RESULT
+            # =================================================
+            #
+            # IMPORTANT:
+            # output_path = input_path
+            #
+            # Jadi:
+            #
+            # Bandung/IMG001.jpg
+            #
+            # tetap:
+            #
+            # Bandung/IMG001.jpg
+            #
+            # =================================================
+
+            results.append(
+                {
+                    "filename":
+                        os.path.basename(
                             input_path
                         ),
 
-                        "input_path": input_path,
+                    "input_path":
+                        input_path,
 
-                        "output_path": input_path,
+                    "output_path":
+                        input_path,
 
-                        "original_rgb": (
-                            image_rgb
-                        ),
+                    "original_rgb":
+                        image_rgb,
 
-                        "result_rgb": (
-                            cv2.cvtColor(
-                                result_bgr,
-                                cv2.COLOR_BGR2RGB
-                            )
-                        ),
+                    "result_rgb":
+                        result_rgb,
 
-                        "mask": mask,
+                    "mask":
+                        mask,
 
-                        "detected_px": (
-                            detected_px
-                        ),
+                    "detected_px":
+                        detected_px,
 
-                        "encoded_bytes": (
-                            encoded_bytes
-                        ),
+                    "encoded_bytes":
+                        encoded,
 
-                        "mime": (
+                    "mime":
+                        (
                             "image/jpeg"
                             if ext.lower()
-                            in [
+                            in (
                                 ".jpg",
                                 ".jpeg"
-                            ]
+                            )
                             else
                             "image/png"
                         ),
 
-                        "method": (
-                            "Classic"
-                        ),
-                    }
-                )
+                    "method":
+                        method_name,
+                }
+            )
 
         except Exception as error:
 
             st.error(
-                f"❌ Gagal `{input_path}`:\n\n"
+                f"❌ Error pada "
+                f"`{input_path}`:\n\n"
                 f"{error}"
             )
 
-        progress_bar.progress(
+        progress.progress(
             (index + 1) / total
         )
 
-    status_text.empty()
+    status.empty()
 
     st.session_state[
         "remover_results"
@@ -1798,8 +1857,7 @@ if results:
     )
 
     st.success(
-        f"Berhasil memproses "
-        f"{len(results)} foto."
+        f"✅ {len(results)} foto berhasil."
     )
 
     # ========================================================
@@ -1823,49 +1881,51 @@ if results:
                 f"Path: `{result['input_path']}`"
             )
 
-            col_before, col_after = (
-                st.columns(2)
+            col1, col2 = st.columns(
+                2
             )
 
-            with col_before:
+            with col1:
 
                 st.image(
                     result[
                         "original_rgb"
                     ],
                     caption="Sebelum",
-                    use_container_width=True,
+                    use_container_width=True
                 )
 
-            with col_after:
+            with col2:
 
                 st.image(
                     result[
                         "result_rgb"
                     ],
                     caption="Sesudah",
-                    use_container_width=True,
+                    use_container_width=True
                 )
 
-            if (
-                show_mask_preview
-                and result["mask"]
-                is not None
-            ):
+            st.caption(
+                f"Metode: "
+                f"`{result['method']}` | "
+                f"Mask: "
+                f"{result['detected_px']:,} px"
+            )
+
+            if show_mask:
 
                 with st.expander(
-                    "🔍 Preview Mask"
+                    "🔍 Lihat Mask"
                 ):
 
                     st.image(
-                        result[
-                            "mask"
-                        ],
+                        result["mask"],
                         caption=(
-                            f"Area terdeteksi: "
-                            f"{result['detected_px']:,} piksel"
+                            "Area yang "
+                            "dikirim untuk "
+                            "inpainting"
                         ),
-                        use_container_width=True,
+                        use_container_width=True
                     )
 
             st.download_button(
@@ -1878,9 +1938,9 @@ if results:
                     "encoded_bytes"
                 ],
 
-                file_name=(
-                    result["filename"]
-                ),
+                file_name=result[
+                    "filename"
+                ],
 
                 mime=result[
                     "mime"
@@ -1888,9 +1948,8 @@ if results:
 
                 key=(
                     f"download_{index}"
-                ),
+                )
             )
-
 
     # ========================================================
     # ZIP
@@ -1901,7 +1960,7 @@ if results:
     )
 
     st.markdown(
-        "## 📦 Download ZIP"
+        "## 📦 ZIP Hasil"
     )
 
     output_zip = (
@@ -1912,8 +1971,8 @@ if results:
 
     st.download_button(
         label=(
-            f"⬇️ DOWNLOAD SEMUA "
-            f"({len(results)} FOTO) "
+            f"⬇️ DOWNLOAD "
+            f"{len(results)} FOTO "
             f"SEBAGAI ZIP"
         ),
 
@@ -1927,7 +1986,13 @@ if results:
 
         type="primary",
 
-        use_container_width=True,
+        use_container_width=True
+    )
+
+    st.success(
+        "📦 Struktur folder ZIP "
+        "dipertahankan dan nama file "
+        "asli tidak diubah."
     )
 
 
@@ -1940,9 +2005,7 @@ st.markdown(
 )
 
 st.caption(
-    "Timestamp Remover V4 — Classic menggunakan "
-    "OpenCV Inpainting. Mode AI menggunakan "
-    "Cloudflare Workers AI REST API dengan "
-    f"`{CLOUDFLARE_MODEL}`. "
-    "Struktur folder ZIP dipertahankan."
+    "Timestamp Remover V5 | "
+    "Cloudflare Workers AI "
+    "stable-diffusion-v1-5-inpainting"
 )
