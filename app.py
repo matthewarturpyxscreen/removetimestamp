@@ -1,1000 +1,146 @@
 # ============================================================
-# TIMESTAMP GENERATOR V7.5 - STREAMLIT UI (ENHANCED UI + AUTOFIT)
+# TIMESTAMP REMOVER V8.0 - STREAMLIT
 # ============================================================
 #
-# FONT:
-# AVHershey Simplex Medium
+# ALUR BARU:
+# Upload foto
+#     ↓
+# Gemini Vision mendeteksi area timestamp
+#     ↓
+# OpenCV membuat pixel mask timestamp
+#     ↓
+# Mask diperlebar secara aman untuk outline/shadow
+#     ↓
+# Inpainting OpenCV
+#     ↓
+# Preview + Download
 #
-# SOURCE:
-# https://github.com/yangcht/Hershey_font_TTF
+# TIDAK ADA:
+# - input text manual
+# - OCR timestamp
+# - font renderer
+# - generate timestamp
 #
-# Port dari versi Google Colab (V7.4 New Input freetext +
-# Gemini OCR). Fungsi inti (normalisasi teks, parsing
-# timestamp, render font, OCR Gemini) TIDAK diubah logikanya
-# -- hanya lapisan UI/IO yang disempurnakan tampilannya.
-#
-# V7.5 (baru):
-# - AUTO-FIT font: baris teks yang kepanjangan (misal nama
-#   lokasi panjang) otomatis mengecilkan ukuran font supaya
-#   TIDAK kepotong di tepi kanan foto. Ukuran font tetap sama
-#   rata untuk ketiga baris (bukan per-baris beda ukuran).
-#
-# Credit:
-# Matthew Artur Panahatan Sitorus
-# Nikita Adriella Virginia Jacob
-# ============================================================
-
-
-# ============================================================
-# IMPORT
 # ============================================================
 
 import os
-import re
 import io
-import glob
+import re
+import json
+import base64
 import hashlib
 import secrets
 import subprocess
+import glob
 
 import cv2
 import numpy as np
 import streamlit as st
 
-from PIL import (
-    Image,
-    ImageDraw,
-    ImageFont,
-    ImageOps
-)
-
+from PIL import Image, ImageOps
 from google import genai
 from google.genai import types as genai_types
 
-from streamlit_paste_button import paste_image_button as pbutton
-
 
 # ============================================================
-# ============================================================
-# CONFIGURATION (SAMA PERSIS DENGAN VERSI COLAB)
-# ============================================================
-# ============================================================
-
-
-# ============================================================
-# MASTER WIDTH
-# ============================================================
-
-REFERENCE_WIDTH = 2048
-
-
-# ============================================================
-# FONT SIZE
-# ============================================================
-
-REFERENCE_FONT_SIZE = 70
-
-# Ukuran timestamp dinyatakan sebagai % dari lebar foto, supaya
-# otomatis mengikuti resolusi/rasio foto apapun yang diupload.
-# Diatur langsung di sini oleh program (bukan lewat UI) --
-# tinggal ganti angka ini kalau mau lebih besar/kecil lagi.
-DEFAULT_FONT_SIZE_PERCENT = 5.0
-
-# --------------------------------------------------------
-# Batas bawah font size (px) saat auto-fit mengecilkan teks.
-# Ini jaring pengaman supaya teks tidak jadi mikroskopis kalau
-# baris lokasinya sangat-sangat panjang -- kalau sudah mentok
-# batas ini, teks dibiarkan sedikit mepet ke tepi daripada
-# jadi tidak terbaca sama sekali.
-# --------------------------------------------------------
-
-MIN_FONT_SIZE_PX = 14
-
-
-# ============================================================
-# TEXT COLOR
-# ============================================================
-
-TEXT_COLOR = (
-    255,
-    255,
-    255
-)
-
-
-# ============================================================
-# OUTLINE
-# ============================================================
-
-REFERENCE_OUTLINE_WIDTH = 2
-
-
-OUTLINE_COLOR = (
-    0,
-    0,
-    0
-)
-
-
-# ============================================================
-# OUTLINE OFFSET
-# ============================================================
-
-REFERENCE_OUTLINE_OFFSET_X = 0
-
-REFERENCE_OUTLINE_OFFSET_Y = 0
-
-
-# ============================================================
-# LETTER SPACING
-# ============================================================
-
-REFERENCE_LETTER_SPACING = -1
-
-
-# ============================================================
-# SPACE SCALE
-# ============================================================
-
-SPACE_SCALE = 0.75
-
-
-# ============================================================
-# POSISI
-# ============================================================
-
-REFERENCE_LEFT_MARGIN = 32
-
-REFERENCE_BOTTOM_MARGIN = 88
-
-REFERENCE_LINE_SPACING = 78
-
-
-# ============================================================
-# TEXT ANCHOR
-# ============================================================
-
-TEXT_ANCHOR = "ls"
-
-
-# ============================================================
-# ============================================================
-# FONT SETUP (DENGAN CACHE STREAMLIT)
-# ============================================================
-# ============================================================
-
-REPO_DIR = "Hershey_font_TTF"
-
-
-# ============================================================
-# DAFTAR KATA UNTUK NAMA FILE RANDOM
-# ============================================================
-#
-# Dipakai buat bikin nama file download unik & gampang dibaca,
-# contoh: FOTO_hangatpelangi.jpg
-# ============================================================
-
-RANDOM_WORD_LIST_A = [
-    "hangat", "cerah", "biru", "senja", "kilat", "lembut",
-    "gemilang", "rindang", "damai", "megah", "riang", "sejuk",
-    "terang", "elok", "anggun", "cepat", "tenang", "ceria",
-]
-
-RANDOM_WORD_LIST_B = [
-    "pelangi", "senja", "camar", "kabut", "elang", "bintang",
-    "ombak", "awan", "bukit", "kilau", "embun", "cakrawala",
-    "merpati", "fajar", "angin", "karang", "hutan", "samudra",
-]
-
-
-@st.cache_resource(show_spinner="Menyiapkan font Hershey...")
-def get_font_path():
-
-    if not os.path.exists(REPO_DIR):
-
-        subprocess.run(
-            [
-                "git",
-                "clone",
-                "-q",
-                "https://github.com/yangcht/Hershey_font_TTF.git",
-                REPO_DIR
-            ],
-            check=True
-        )
-
-    font_candidates = glob.glob(
-        REPO_DIR + "/**/*Simplex*Medium*.ttf",
-        recursive=True
-    )
-
-    if len(font_candidates) == 0:
-
-        raise Exception(
-            "Font AVHershey Simplex Medium tidak ditemukan."
-        )
-
-    return font_candidates[0]
-
-
-# ------------------------------------------------------------
-# Cache objek font per (path, size) supaya file .ttf tidak
-# di-parse ulang dari disk setiap kali generate dipanggil --
-# ImageFont.truetype() lumayan mahal kalau dipanggil berulang.
-# ------------------------------------------------------------
-
-@st.cache_resource(show_spinner=False)
-def get_font(font_path, font_size):
-
-    return ImageFont.truetype(
-        font_path,
-        font_size
-    )
-
-
-# ============================================================
-# ============================================================
-# OCR PAKAI GEMINI AI (LOGIKA SAMA DENGAN VERSI COLAB)
-# ============================================================
+# CONFIG
 # ============================================================
 
 GEMINI_MODEL_NAME = "gemini-flash-lite-latest"
 
+# Seberapa jauh mask diperluas untuk menangkap outline/shadow.
+MASK_DILATE_PX = 3
 
-# ============================================================
-# LOAD FOTO DENGAN FIX ORIENTASI EXIF
-# ============================================================
-#
-# cv2.imread() TIDAK membaca tag EXIF Orientation, jadi foto
-# dari HP yang disimpan dengan tag "rotate 90/180/270" akan
-# terbaca apa adanya (raw sensor orientation) oleh OpenCV.
-#
-# Akibatnya timestamp yang kita gambar (selalu lurus/horizontal
-# di array mentah) jadi ikut miring begitu foto ditampilkan di
-# viewer lain yang MENGHORMATI tag EXIF tersebut.
-#
-# Fix: normalisasi orientasi dulu pakai PIL (ImageOps.exif_transpose)
-# SEBELUM digambar, supaya pixel-nya benar2 sudah tegak sesuai
-# tampilan aslinya, dan text yang kita gambar horizontal akan
-# selalu terlihat lurus di manapun foto ini dibuka.
-# ============================================================
+# Radius inpainting.
+INPAINT_RADIUS = 3
 
-def load_pil_image_fixed_orientation(uploaded_file):
+# OpenCV inpainting method.
+# TELEA biasanya bagus untuk area teks kecil.
+INPAINT_METHOD = cv2.INPAINT_TELEA
 
-    pil_image = Image.open(
-        uploaded_file
-    )
+# Untuk menghindari mask mengambil seluruh background.
+# Pixel putih timestamp biasanya memiliki saturation rendah.
+WHITE_VALUE_THRESHOLD = 150
+WHITE_SATURATION_THRESHOLD = 90
 
-    pil_image = ImageOps.exif_transpose(
-        pil_image
-    )
+# Toleransi untuk pixel gelap yang berada di sekitar teks putih.
+DARK_VALUE_THRESHOLD = 100
 
-    pil_image = pil_image.convert(
-        "RGB"
-    )
+# Timestamp GPS camera umumnya berada di bagian bawah foto.
+BOTTOM_REGION_RATIO = 0.45
 
-    return pil_image
-
-
-GEMINI_OCR_PROMPT = """
-Gambar ini adalah screenshot yang berisi overlay timestamp
-GPS kamera (koordinat, lokasi, tanggal & jam).
-
-Baca teks overlay timestamp tersebut PERSIS seperti yang
-tertulis di gambar, tanpa mengubah, membetulkan, atau
-menerka-nerka isinya.
-
-Keluarkan HANYA 3 baris berikut, tanpa penjelasan tambahan,
-tanpa markdown, tanpa tanda kutip:
-
-Baris 1: koordinat (lintang, bujur)
-Baris 2: nama lokasi
-Baris 3: tanggal dan jam (dan WIB/zona waktu jika ada)
-""".strip()
-
-
-def ocr_extract_text_gemini(
-    pil_image,
-    api_key
-):
-
-    client = genai.Client(
-        api_key=api_key
-    )
-
-    # --------------------------------------------------------
-    # Convert PIL image ke bytes PNG
-    # --------------------------------------------------------
-
-    image_buffer = io.BytesIO()
-
-    pil_image.save(
-        image_buffer,
-        format="PNG"
-    )
-
-    image_bytes = image_buffer.getvalue()
-
-    # --------------------------------------------------------
-    # Kirim ke Gemini
-    # --------------------------------------------------------
-
-    response = client.models.generate_content(
-
-        model=GEMINI_MODEL_NAME,
-
-        contents=[
-
-            genai_types.Part.from_bytes(
-                data=image_bytes,
-                mime_type="image/png"
-            ),
-
-            GEMINI_OCR_PROMPT
-        ]
-    )
-
-    raw_text = response.text or ""
-
-    # --------------------------------------------------------
-    # Bersihkan kemungkinan markdown code fence
-    # kalau Gemini iseng bungkus jawabannya
-    # --------------------------------------------------------
-
-    raw_text = re.sub(
-        r"^```[a-zA-Z]*\n?",
-        "",
-        raw_text.strip()
-    )
-
-    raw_text = re.sub(
-        r"```$",
-        "",
-        raw_text.strip()
-    )
-
-    lines = [
-        line.strip()
-        for line in raw_text.splitlines()
-        if line.strip()
-    ]
-
-    return "\n".join(lines)
+# Maksimum area mask dibanding luas region timestamp.
+# Safety guard agar background tidak ikut terhapus besar-besaran.
+MAX_MASK_RATIO_IN_REGION = 0.35
 
 
 # ============================================================
-# ============================================================
-# NORMALISASI TEXT (LOGIKA SAMA DENGAN VERSI COLAB)
-# ============================================================
-# ============================================================
-
-def normalize_coordinate(text):
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text.strip()
-    )
-
-    text = re.sub(
-        r"\s*,",
-        ",",
-        text
-    )
-
-    text = re.sub(
-        r",\s*",
-        ",  ",
-        text
-    )
-
-    return text
-
-
-def normalize_location(text):
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text.strip()
-    )
-
-    text = re.sub(
-        r"\s*,",
-        ",",
-        text
-    )
-
-    text = re.sub(
-        r",\s*",
-        ",  ",
-        text
-    )
-
-    return text
-
-
-def normalize_datetime(text):
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text.strip()
-    )
-
-    time_match = re.search(
-        r"\b(\d{1,2}:\d{2}:\d{2})\b",
-        text
-    )
-
-    if time_match:
-
-        time_value = time_match.group(1)
-
-        before = text[
-            :time_match.start()
-        ].strip()
-
-        after = text[
-            time_match.end():
-        ].strip()
-
-        after = re.sub(
-            r"^\s*WIB\s*$",
-            "WIB",
-            after,
-            flags=re.IGNORECASE
-        )
-
-        if after:
-
-            return (
-                before
-                + " "
-                + time_value
-                + "  "
-                + after
-            )
-
-        else:
-
-            return (
-                before
-                + " "
-                + time_value
-            )
-
-    return text
-
-
-# ============================================================
-# PARSE TIMESTAMP
-# ============================================================
-
-def parse_timestamp(raw_text):
-
-    lines = raw_text.splitlines()
-
-    lines = [
-        line.strip()
-        for line in lines
-        if line.strip()
-    ]
-
-    if len(lines) != 3:
-
-        raise ValueError(
-            "Input harus terdiri dari tepat 3 baris."
-        )
-
-    line1 = normalize_coordinate(
-        lines[0]
-    )
-
-    line2 = normalize_location(
-        lines[1]
-    )
-
-    line3 = normalize_datetime(
-        lines[2]
-    )
-
-    return [
-        line1,
-        line2,
-        line3
-    ]
-
-
-# ============================================================
-# ============================================================
-# DRAW TIMESTAMP (LOGIKA SAMA DENGAN VERSI COLAB)
-# ============================================================
-# ============================================================
-
-def draw_timestamp(
-    draw,
-    text,
-    x,
-    baseline,
-    font,
-    outline_width,
-    letter_spacing,
-    space_scale,
-    outline_offset_x,
-    outline_offset_y
-):
-
-    current_x = float(x)
-
-    # Lebar spasi sama untuk semua karakter " " di baris yang
-    # sama, jadi dihitung sekali saja sebelum loop
-    space_width = draw.textlength(
-        " ",
-        font=font
-    ) * space_scale
-
-    for char in text:
-
-        if char == " ":
-
-            current_x += (
-                space_width +
-                letter_spacing
-            )
-
-            continue
-
-        draw.text(
-
-            (
-                round(
-                    current_x +
-                    outline_offset_x
-                ),
-
-                round(
-                    baseline +
-                    outline_offset_y
-                )
-            ),
-
-            char,
-
-            font=font,
-
-            fill=TEXT_COLOR,
-
-            stroke_width=outline_width,
-
-            stroke_fill=OUTLINE_COLOR,
-
-            anchor=TEXT_ANCHOR
-        )
-
-        char_width = draw.textlength(
-            char,
-            font=font
-        )
-
-        current_x += (
-            char_width +
-            letter_spacing
-        )
-
-
-# ============================================================
-# ============================================================
-# UKUR LEBAR TEKS (BUAT AUTO-FIT, TANPA MENGGAMBAR APAPUN)
-# ============================================================
-# ============================================================
-#
-# Rumus lebar ini SENGAJA dibuat identik dengan logika loop
-# di draw_timestamp() di atas (char demi char + letter_spacing,
-# spasi pakai space_scale) supaya angka yang diukur benar-benar
-# merepresentasikan lebar hasil gambar yang sebenarnya.
-# ============================================================
-
-def measure_line_width(
-    measure_draw,
-    text,
-    font,
-    letter_spacing,
-    space_scale
-):
-
-    space_width = measure_draw.textlength(
-        " ",
-        font=font
-    ) * space_scale
-
-    total_width = 0.0
-
-    for char in text:
-
-        if char == " ":
-
-            total_width += (
-                space_width +
-                letter_spacing
-            )
-
-        else:
-
-            total_width += (
-                measure_draw.textlength(
-                    char,
-                    font=font
-                ) +
-                letter_spacing
-            )
-
-    return total_width
-
-
-# ============================================================
-# ============================================================
-# GENERATE TIMESTAMP (LOGIKA SAMA, INPUT/OUTPUT PAKAI BYTES)
-# ============================================================
-# ============================================================
-
-def generate_timestamp_image(
-    image_cv,
-    raw_timestamp_text,
-    font_size_percent=DEFAULT_FONT_SIZE_PERCENT
-):
-
-    lines = parse_timestamp(
-        raw_timestamp_text
-    )
-
-    line1 = lines[0]
-
-    line2 = lines[1]
-
-    line3 = lines[2]
-
-    height, width = image_cv.shape[:2]
-
-    # --------------------------------------------------------
-    # Font size AWAL dihitung dari % lebar foto (seperti biasa)
-    # --------------------------------------------------------
-
-    font_size = max(
-        1,
-        round(
-            width *
-            (font_size_percent / 100)
-        )
-    )
-
-    font_path = get_font_path()
-
-    # --------------------------------------------------------
-    # AUTO-FIT
-    #
-    # font_size di atas cuma mempertimbangkan lebar FOTO, belum
-    # mempertimbangkan lebar TEKS. Kalau baris terpanjang
-    # (biasanya baris lokasi) lebih lebar dari ruang yang
-    # tersedia (lebar foto - margin kiri - margin kanan), maka
-    # font dikecilkan proporsional sampai muat, lalu diukur
-    # ulang -- diulang beberapa kali sampai konvergen (biasanya
-    # cukup 1-2 kali karena lebar teks kurang-lebih linear
-    # terhadap font_size).
-    #
-    # font_size tetap SATU ANGKA untuk ketiga baris, biar
-    # tampilannya tetap konsisten & rapi.
-    # --------------------------------------------------------
-
-    measure_draw = ImageDraw.Draw(
-        Image.new(
-            "RGB",
-            (1, 1)
-        )
-    )
-
-    scale_ratio = None
-    left_margin = None
-    right_margin = None
-    letter_spacing = None
-    font = None
-
-    for _ in range(6):
-
-        scale_ratio = (
-            font_size /
-            REFERENCE_FONT_SIZE
-        )
-
-        left_margin = round(
-            REFERENCE_LEFT_MARGIN *
-            scale_ratio
-        )
-
-        # Margin kanan dibuat sama dengan margin kiri sebagai
-        # ruang aman simetris, supaya teks tidak mepet ke tepi
-        # kanan foto.
-        right_margin = left_margin
-
-        letter_spacing = (
-            REFERENCE_LETTER_SPACING *
-            scale_ratio
-        )
-
-        font = get_font(
-            font_path,
-            font_size
-        )
-
-        max_line_width = max(
-            measure_line_width(
-                measure_draw, line1, font, letter_spacing, SPACE_SCALE
-            ),
-            measure_line_width(
-                measure_draw, line2, font, letter_spacing, SPACE_SCALE
-            ),
-            measure_line_width(
-                measure_draw, line3, font, letter_spacing, SPACE_SCALE
-            ),
-        )
-
-        available_width = width - left_margin - right_margin
-
-        if max_line_width <= available_width:
-
-            break
-
-        if font_size <= MIN_FONT_SIZE_PX:
-
-            # Sudah mentok batas bawah -- biarkan sedikit mepet
-            # daripada teks jadi tidak terbaca sama sekali.
-            break
-
-        shrink_ratio = available_width / max_line_width
-
-        # Faktor 0.97 = sedikit buffer aman supaya tidak
-        # langsung pas-pasan di tepi banget setelah dibulatkan.
-        font_size = max(
-            MIN_FONT_SIZE_PX,
-            int(font_size * shrink_ratio * 0.97)
-        )
-
-    auto_fit_applied = (
-        font_size <
-        max(1, round(width * (font_size_percent / 100)))
-    )
-
-    # --------------------------------------------------------
-    # Lanjut seperti biasa dengan font_size FINAL hasil auto-fit
-    # --------------------------------------------------------
-
-    outline_width = max(
-        1,
-        round(
-            REFERENCE_OUTLINE_WIDTH *
-            scale_ratio
-        )
-    )
-
-    bottom_margin = round(
-        REFERENCE_BOTTOM_MARGIN *
-        scale_ratio
-    )
-
-    line_spacing = round(
-        REFERENCE_LINE_SPACING *
-        scale_ratio
-    )
-
-    outline_offset_x = round(
-        REFERENCE_OUTLINE_OFFSET_X *
-        scale_ratio
-    )
-
-    outline_offset_y = round(
-        REFERENCE_OUTLINE_OFFSET_Y *
-        scale_ratio
-    )
-
-    pil_image = Image.fromarray(
-        image_cv
-    )
-
-    draw = ImageDraw.Draw(
-        pil_image
-    )
-
-    baseline3 = (
-        height -
-        bottom_margin
-    )
-
-    baseline2 = (
-        baseline3 -
-        line_spacing
-    )
-
-    baseline1 = (
-        baseline2 -
-        line_spacing
-    )
-
-    draw_timestamp(
-        draw,
-        line1,
-        left_margin,
-        baseline1,
-        font,
-        outline_width,
-        letter_spacing,
-        SPACE_SCALE,
-        outline_offset_x,
-        outline_offset_y
-    )
-
-    draw_timestamp(
-        draw,
-        line2,
-        left_margin,
-        baseline2,
-        font,
-        outline_width,
-        letter_spacing,
-        SPACE_SCALE,
-        outline_offset_x,
-        outline_offset_y
-    )
-
-    draw_timestamp(
-        draw,
-        line3,
-        left_margin,
-        baseline3,
-        font,
-        outline_width,
-        letter_spacing,
-        SPACE_SCALE,
-        outline_offset_x,
-        outline_offset_y
-    )
-
-    info = {
-        "line1": line1,
-        "line2": line2,
-        "line3": line3,
-        "font_size": font_size,
-        "scale_ratio": scale_ratio,
-        "outline_width": outline_width,
-        "letter_spacing": letter_spacing,
-        "left_margin": left_margin,
-        "bottom_margin": bottom_margin,
-        "line_spacing": line_spacing,
-        "auto_fit_applied": auto_fit_applied
-    }
-
-    return pil_image, info
-
-
-# ============================================================
-# ============================================================
-# STREAMLIT UI CONFIG & MODERN STYLING
-# ============================================================
+# PAGE
 # ============================================================
 
 st.set_page_config(
-    page_title="Timestamp Generator | GPS Camera Style",
-    page_icon="🕒",
+    page_title="Timestamp Remover | AI",
+    page_icon="🧹",
     layout="centered",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="collapsed",
 )
 
 
-# ------------------------------------------------------------
-# CUSTOM CSS UNTUK TAMPILAN MODERN & CLEAN
-# ------------------------------------------------------------
+# ============================================================
+# CSS
+# ============================================================
 
 st.markdown(
     """
     <style>
-    /* Card Container & Shadow */
     div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlockBorderWrapper"] {
         border-radius: 14px;
         box-shadow: 0 4px 20px rgba(0, 0, 0, 0.04);
         border: 1px solid rgba(140, 140, 140, 0.16);
-        transition: all 0.2s ease-in-out;
     }
-    
-    /* Hero Header */
+
     .hero-title {
         font-size: 2.1rem;
         font-weight: 800;
         letter-spacing: -0.5px;
         margin-bottom: 0.2rem;
     }
+
     .hero-badge {
         display: inline-block;
         font-size: 0.75rem;
         font-weight: 700;
         padding: 3px 10px;
         border-radius: 20px;
-        background: linear-gradient(135deg, #2563eb, #3b82f6);
+        background: linear-gradient(135deg, #059669, #10b981);
         color: white !important;
         text-transform: uppercase;
         letter-spacing: 0.5px;
         margin-bottom: 0.6rem;
     }
+
     .hero-desc {
         color: var(--text-color, #6b7280);
         font-size: 0.95rem;
         margin-bottom: 1.2rem;
     }
 
-    /* Stepper Status Bar */
-    .stepper-container {
-        display: flex;
-        gap: 8px;
-        margin-bottom: 1.5rem;
-        flex-wrap: wrap;
-    }
-    .step-pill {
-        flex: 1 1 auto;
-        min-width: 140px;
-        padding: 8px 12px;
-        border-radius: 10px;
-        font-size: 0.82rem;
-        font-weight: 600;
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        border: 1px solid rgba(140, 140, 140, 0.2);
-        background: rgba(140, 140, 140, 0.06);
-    }
-    .step-pill.active {
-        border-color: #3b82f6;
-        background: rgba(59, 130, 246, 0.1);
-        color: #2563eb;
-    }
-    .step-pill.done {
-        border-color: #10b981;
-        background: rgba(16, 185, 129, 0.1);
-        color: #059669;
-    }
-
-    /* Button Styling */
-    div[data-testid="stDownloadButton"] button,
-    div[data-testid="stButton"] button {
+    div[data-testid="stButton"] button,
+    div[data-testid="stDownloadButton"] button {
         border-radius: 10px;
         font-weight: 600;
         padding: 0.55rem 1rem;
-        transition: transform 0.1s ease, box-shadow 0.2s ease;
-    }
-    div[data-testid="stButton"] button:hover {
-        transform: translateY(-1px);
     }
 
-    /* Metric Cards */
-    div[data-testid="stMetric"] {
-        background-color: rgba(140, 140, 140, 0.07);
-        border: 1px solid rgba(140, 140, 140, 0.14);
-        border-radius: 12px;
-        padding: 10px 14px;
-    }
-    div[data-testid="stMetric"] label {
-        font-weight: 600;
-        font-size: 0.8rem;
-    }
-
-    /* Info Badge Box */
     .info-card {
         padding: 12px 16px;
         border-radius: 10px;
         background: rgba(140, 140, 140, 0.06);
-        border-left: 4px solid #3b82f6;
+        border-left: 4px solid #10b981;
         margin: 10px 0;
         font-size: 0.9rem;
     }
 
-    /* Footer */
     .footer-text {
         text-align: center;
         font-size: 0.82rem;
@@ -1003,70 +149,608 @@ st.markdown(
     }
     </style>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
 
 
-# ------------------------------------------------------------
-# SESSION STATE AWAL
-# ------------------------------------------------------------
+# ============================================================
+# SESSION STATE
+# ============================================================
 
 DEFAULTS = {
     "uploader_version": 0,
-    "generated_result": None,
-    "last_ocr_signature": None,
+    "remove_result": None,
+    "last_detection_signature": None,
 }
 
-for state_key, default_value in DEFAULTS.items():
-
-    if state_key not in st.session_state:
-
-        st.session_state[state_key] = default_value
+for key, value in DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 
 def reset_app():
-
     st.session_state.uploader_version += 1
-
-    st.session_state.last_ocr_signature = None
-
-    st.session_state.generated_result = None
+    st.session_state.remove_result = None
+    st.session_state.last_detection_signature = None
 
 
 uploader_version = st.session_state.uploader_version
 
-timestamp_key = f"timestamp_box_{uploader_version}"
+
+# ============================================================
+# LOAD IMAGE
+# ============================================================
+
+def load_pil_image_fixed_orientation(uploaded_file):
+    image = Image.open(uploaded_file)
+    image = ImageOps.exif_transpose(image)
+    return image.convert("RGB")
 
 
-# ------------------------------------------------------------
-# HERO HEADER & STEP STATUS BAR
-# ------------------------------------------------------------
+# ============================================================
+# GEMINI PROMPT
+# ============================================================
 
-st.markdown('<div class="hero-badge">⚡ V7.5 • AVHershey Font Engine + Auto-Fit</div>', unsafe_allow_html=True)
-st.markdown('<div class="hero-title">🕒 Timestamp Generator</div>', unsafe_allow_html=True)
+GEMINI_REMOVE_PROMPT = """
+You are an image analysis system whose ONLY task is to locate a GPS
+camera timestamp overlay so it can be removed from the image.
+
+IMPORTANT:
+- Do NOT transcribe the timestamp text.
+- Do NOT return the timestamp text.
+- Do NOT describe the timestamp contents.
+- Only identify its visual region.
+- The timestamp may contain multiple lines.
+- It may contain GPS coordinates, location, date, time, and timezone.
+- It is commonly located near the bottom of the image.
+- It may use white text with a black outline or shadow.
+- Do not include normal objects, people, buildings, roads, sky,
+  vegetation, or other photographic content in the timestamp box.
+
+Return ONLY valid JSON in this exact structure:
+
+{
+  "found": true,
+  "confidence": 0.0,
+  "box": {
+    "x1": 0,
+    "y1": 0,
+    "x2": 0,
+    "y2": 0
+  }
+}
+
+Coordinates MUST be normalized from 0 to 1000 relative to the image:
+- x1 = left
+- y1 = top
+- x2 = right
+- y2 = bottom
+
+If there is no GPS camera timestamp overlay, return:
+
+{
+  "found": false,
+  "confidence": 0.0,
+  "box": {
+    "x1": 0,
+    "y1": 0,
+    "x2": 0,
+    "y2": 0
+  }
+}
+""".strip()
+
+
+# ============================================================
+# GEMINI DETECTION
+# ============================================================
+
+def _extract_json_from_response(text):
+    text = (text or "").strip()
+
+    text = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Coba langsung.
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Cari object JSON pertama.
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+
+    if match:
+        return json.loads(match.group(0))
+
+    raise ValueError("Gemini tidak mengembalikan JSON yang valid.")
+
+
+def detect_timestamp_region(pil_image, api_key):
+    client = genai.Client(api_key=api_key)
+
+    buffer = io.BytesIO()
+    pil_image.save(buffer, format="JPEG", quality=95)
+
+    image_bytes = buffer.getvalue()
+
+    response = client.models.generate_content(
+        model=GEMINI_MODEL_NAME,
+        contents=[
+            genai_types.Part.from_bytes(
+                data=image_bytes,
+                mime_type="image/jpeg",
+            ),
+            GEMINI_REMOVE_PROMPT,
+        ],
+    )
+
+    data = _extract_json_from_response(response.text)
+
+    found = bool(data.get("found", False))
+    confidence = float(data.get("confidence", 0.0) or 0.0)
+
+    box = data.get("box") or {}
+
+    x1 = float(box.get("x1", 0))
+    y1 = float(box.get("y1", 0))
+    x2 = float(box.get("x2", 0))
+    y2 = float(box.get("y2", 0))
+
+    return {
+        "found": found,
+        "confidence": max(0.0, min(1.0, confidence)),
+        "box_norm": {
+            "x1": max(0.0, min(1000.0, x1)),
+            "y1": max(0.0, min(1000.0, y1)),
+            "x2": max(0.0, min(1000.0, x2)),
+            "y2": max(0.0, min(1000.0, y2)),
+        },
+    }
+
+
+# ============================================================
+# BOX CONVERSION
+# ============================================================
+
+def normalized_box_to_pixels(box_norm, width, height):
+    x1 = int(round((box_norm["x1"] / 1000.0) * width))
+    y1 = int(round((box_norm["y1"] / 1000.0) * height))
+    x2 = int(round((box_norm["x2"] / 1000.0) * width))
+    y2 = int(round((box_norm["y2"] / 1000.0) * height))
+
+    x1 = max(0, min(width - 1, x1))
+    y1 = max(0, min(height - 1, y1))
+    x2 = max(0, min(width, x2))
+    y2 = max(0, min(height, y2))
+
+    return x1, y1, x2, y2
+
+
+def validate_box(x1, y1, x2, y2, width, height):
+    if x2 <= x1 or y2 <= y1:
+        return False
+
+    box_area = (x2 - x1) * (y2 - y1)
+
+    if box_area <= 0:
+        return False
+
+    image_area = width * height
+
+    # Timestamp box yang tiba-tiba mengambil > 60% foto
+    # dianggap tidak valid.
+    if box_area > image_area * 0.60:
+        return False
+
+    return True
+
+
+# ============================================================
+# PIXEL MASK
+# ============================================================
+
+def create_timestamp_pixel_mask(image_bgr, box):
+    """
+    Membuat mask dari pixel timestamp di dalam bounding box AI.
+
+    Strategi:
+    1. Fokus hanya pada region yang diberikan Gemini.
+    2. Cari pixel terang/putih yang umum digunakan timestamp.
+    3. Cari edge/outline yang dekat dengan pixel timestamp.
+    4. Gunakan morphology untuk menghubungkan karakter.
+    5. Batasi luas mask sebagai safety guard.
+    """
+
+    height, width = image_bgr.shape[:2]
+
+    x1, y1, x2, y2 = box
+
+    region = image_bgr[y1:y2, x1:x2].copy()
+
+    if region.size == 0:
+        return np.zeros((height, width), dtype=np.uint8), {
+            "mask_pixels": 0,
+            "mask_ratio": 0.0,
+            "box": box,
+        }
+
+    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+
+    h, s, v = cv2.split(hsv)
+
+    # --------------------------------------------------------
+    # MASK 1: PIXEL PUTIH / TERANG
+    # --------------------------------------------------------
+
+    white_mask = cv2.inRange(
+        hsv,
+        np.array([0, 0, WHITE_VALUE_THRESHOLD], dtype=np.uint8),
+        np.array([180, WHITE_SATURATION_THRESHOLD, 255], dtype=np.uint8),
+    )
+
+    # --------------------------------------------------------
+    # MASK 2: EDGE
+    # --------------------------------------------------------
+
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+
+    edges = cv2.Canny(
+        gray,
+        50,
+        150,
+    )
+
+    # Edge hanya dipakai di sekitar kandidat pixel putih.
+    nearby_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (9, 9),
+    )
+
+    expanded_white = cv2.dilate(
+        white_mask,
+        nearby_kernel,
+        iterations=1,
+    )
+
+    nearby_edges = cv2.bitwise_and(
+        edges,
+        expanded_white,
+    )
+
+    # --------------------------------------------------------
+    # GABUNG
+    # --------------------------------------------------------
+
+    mask_region = cv2.bitwise_or(
+        white_mask,
+        nearby_edges,
+    )
+
+    # --------------------------------------------------------
+    # CLEAN NOISE
+    # --------------------------------------------------------
+
+    small_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (2, 2),
+    )
+
+    mask_region = cv2.morphologyEx(
+        mask_region,
+        cv2.MORPH_OPEN,
+        small_kernel,
+        iterations=1,
+    )
+
+    # Sambungkan bagian karakter yang terputus.
+    connect_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (3, 3),
+    )
+
+    mask_region = cv2.morphologyEx(
+        mask_region,
+        cv2.MORPH_CLOSE,
+        connect_kernel,
+        iterations=1,
+    )
+
+    # Sedikit dilate untuk menangkap outline hitam.
+    if MASK_DILATE_PX > 0:
+        dilate_size = MASK_DILATE_PX * 2 + 1
+
+        dilate_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (dilate_size, dilate_size),
+        )
+
+        mask_region = cv2.dilate(
+            mask_region,
+            dilate_kernel,
+            iterations=1,
+        )
+
+    # --------------------------------------------------------
+    # COMPONENT FILTER
+    # --------------------------------------------------------
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask_region,
+        connectivity=8,
+    )
+
+    filtered = np.zeros_like(mask_region)
+
+    region_area = mask_region.shape[0] * mask_region.shape[1]
+
+    min_component_area = max(
+        2,
+        int(region_area * 0.000002),
+    )
+
+    for label in range(1, num_labels):
+        area = stats[label, cv2.CC_STAT_AREA]
+
+        if area >= min_component_area:
+            filtered[labels == label] = 255
+
+    mask_region = filtered
+
+    # --------------------------------------------------------
+    # SAFETY GUARD
+    # --------------------------------------------------------
+
+    mask_pixels = int(np.count_nonzero(mask_region))
+    mask_ratio = mask_pixels / max(1, region_area)
+
+    # Kalau mask terlalu besar, jangan langsung inpaint.
+    # Ini biasanya berarti background ikut terdeteksi.
+    if mask_ratio > MAX_MASK_RATIO_IN_REGION:
+        # Turunkan kembali ke kandidat putih saja.
+        mask_region = white_mask.copy()
+
+        mask_region = cv2.morphologyEx(
+            mask_region,
+            cv2.MORPH_CLOSE,
+            connect_kernel,
+            iterations=1,
+        )
+
+        if MASK_DILATE_PX > 0:
+            mask_region = cv2.dilate(
+                mask_region,
+                dilate_kernel,
+                iterations=1,
+            )
+
+        mask_pixels = int(np.count_nonzero(mask_region))
+        mask_ratio = mask_pixels / max(1, region_area)
+
+    # --------------------------------------------------------
+    # MASUKKAN KEMBALI KE UKURAN FOTO
+    # --------------------------------------------------------
+
+    full_mask = np.zeros(
+        (height, width),
+        dtype=np.uint8,
+    )
+
+    full_mask[y1:y2, x1:x2] = mask_region
+
+    info = {
+        "mask_pixels": mask_pixels,
+        "mask_ratio": mask_ratio,
+        "box": box,
+    }
+
+    return full_mask, info
+
+
+# ============================================================
+# OPTIONAL: VISUALIZE MASK
+# ============================================================
+
+def create_mask_preview(image_rgb, mask):
+    preview = image_rgb.copy()
+
+    # Overlay merah untuk area yang akan diinpaint.
+    overlay = preview.copy()
+    overlay[mask > 0] = [255, 0, 0]
+
+    preview = cv2.addWeighted(
+        preview,
+        0.70,
+        overlay,
+        0.30,
+        0,
+    )
+
+    return preview
+
+
+# ============================================================
+# INPAINT
+# ============================================================
+
+def remove_timestamp_with_inpainting(image_rgb, mask):
+    image_bgr = cv2.cvtColor(
+        image_rgb,
+        cv2.COLOR_RGB2BGR,
+    )
+
+    result_bgr = cv2.inpaint(
+        image_bgr,
+        mask,
+        INPAINT_RADIUS,
+        INPAINT_METHOD,
+    )
+
+    result_rgb = cv2.cvtColor(
+        result_bgr,
+        cv2.COLOR_BGR2RGB,
+    )
+
+    return result_rgb
+
+
+# ============================================================
+# ENCODE OUTPUT
+# ============================================================
+
+def encode_image(image_rgb, original_name):
+    name, ext = os.path.splitext(original_name)
+
+    if ext.lower() not in [".jpg", ".jpeg", ".png", ".webp"]:
+        ext = ".jpg"
+
+    random_word = (
+        secrets.choice(
+            [
+                "bersih",
+                "jernih",
+                "clean",
+                "rapi",
+                "natural",
+                "fresh",
+            ]
+        )
+        + secrets.choice(
+            [
+                "foto",
+                "image",
+                "hasil",
+                "camera",
+                "photo",
+            ]
+        )
+    )
+
+    output_name = f"{name}_removed_{random_word}{ext}"
+
+    if ext.lower() in [".jpg", ".jpeg"]:
+        encode_success, encoded = cv2.imencode(
+            ".jpg",
+            cv2.cvtColor(
+                image_rgb,
+                cv2.COLOR_RGB2BGR,
+            ),
+            [
+                cv2.IMWRITE_JPEG_QUALITY,
+                95,
+            ],
+        )
+
+        mime_type = "image/jpeg"
+
+    elif ext.lower() == ".webp":
+        encode_success, encoded = cv2.imencode(
+            ".webp",
+            cv2.cvtColor(
+                image_rgb,
+                cv2.COLOR_RGB2BGR,
+            ),
+            [
+                cv2.IMWRITE_WEBP_QUALITY,
+                95,
+            ],
+        )
+
+        mime_type = "image/webp"
+
+    else:
+        encode_success, encoded = cv2.imencode(
+            ".png",
+            cv2.cvtColor(
+                image_rgb,
+                cv2.COLOR_RGB2BGR,
+            ),
+        )
+
+        mime_type = "image/png"
+
+    if not encode_success:
+        raise RuntimeError("Gagal melakukan encode gambar hasil.")
+
+    return (
+        output_name,
+        encoded.tobytes(),
+        mime_type,
+    )
+
+
+# ============================================================
+# HEADER
+# ============================================================
+
 st.markdown(
-    '<div class="hero-desc">Watermark timestamp presisi tinggi gaya <b>GPS Map Camera</b> '
-    'dengan normalisasi orientasi EXIF, auto-fit font, & OCR bertenaga <b>Gemini AI</b>.</div>',
-    unsafe_allow_html=True
+    '<div class="hero-badge">⚡ V8.0 • AI Detection + Pixel Mask + Inpainting</div>',
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    '<div class="hero-title">🧹 Timestamp Remover</div>',
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    '<div class="hero-desc">'
+    'Hapus timestamp GPS Camera dari foto secara otomatis menggunakan '
+    '<b>Gemini Vision + OpenCV Pixel Mask + Inpainting</b>. '
+    'Tidak perlu memasukkan teks timestamp.'
+    '</div>',
+    unsafe_allow_html=True,
 )
 
 
-# ------------------------------------------------------------
-# 1. UPLOAD FOTO UTAMA
-# ------------------------------------------------------------
+# ============================================================
+# API KEY
+# ============================================================
 
-st.markdown("### 1️⃣ Upload Foto Utama")
+gemini_api_key = st.secrets.get(
+    "GEMINI_API_KEY",
+    "",
+)
 
-image_cv = None
+if not gemini_api_key:
+    st.warning(
+        "⚠️ **GEMINI_API_KEY belum dikonfigurasi.** "
+        "Tambahkan `GEMINI_API_KEY` pada Streamlit Secrets."
+    )
+
+
+# ============================================================
+# STEP 1 - UPLOAD
+# ============================================================
+
+st.markdown("### 1️⃣ Upload Foto")
+
+image_rgb = None
 photo_file = None
 
 with st.container(border=True):
 
     photo_file = st.file_uploader(
-        "Pilih file foto (JPG, JPEG, PNG)",
-        type=["jpg", "jpeg", "png"],
+        "Pilih foto yang ingin dihapus timestamp-nya",
+        type=[
+            "jpg",
+            "jpeg",
+            "png",
+            "webp",
+        ],
         key=f"photo_uploader_{uploader_version}",
-        help="Foto akan dinormalisasi orientasi EXIF-nya secara otomatis agar watermark selalu tegak lurus."
+        help="Orientasi EXIF akan dinormalisasi otomatis.",
     )
 
     if photo_file is not None:
@@ -1077,7 +761,7 @@ with st.container(border=True):
                 photo_file
             )
 
-            image_cv = np.array(
+            image_rgb = np.array(
                 photo_pil
             )
 
@@ -1087,472 +771,357 @@ with st.container(border=True):
                 f"❌ Foto tidak dapat dibaca: {error}"
             )
 
-            image_cv = None
+            image_rgb = None
 
-        if image_cv is not None:
+        if image_rgb is not None:
 
-            height, width = image_cv.shape[:2]
+            height, width = image_rgb.shape[:2]
 
-            col_name, col_res, col_aspect = st.columns(3)
+            col1, col2, col3 = st.columns(3)
 
-            with col_name:
-
+            with col1:
                 st.metric(
                     "📄 File",
-                    photo_file.name if len(photo_file.name) <= 18 else photo_file.name[:15] + "..."
+                    photo_file.name
+                    if len(photo_file.name) <= 22
+                    else photo_file.name[:19] + "...",
                 )
 
-            with col_res:
-
+            with col2:
                 st.metric(
                     "📐 Resolusi",
-                    f"{width} × {height} px"
+                    f"{width} × {height}",
                 )
 
-            with col_aspect:
+            with col3:
+                aspect = width / height if height else 1.0
 
-                aspect = width / height if height > 0 else 1.0
-                aspect_label = "Landscape" if aspect > 1.1 else ("Portrait" if aspect < 0.9 else "Square")
+                if aspect > 1.1:
+                    orientation = "Landscape"
+                elif aspect < 0.9:
+                    orientation = "Portrait"
+                else:
+                    orientation = "Square"
 
                 st.metric(
                     "🧭 Orientasi",
-                    f"{aspect_label} ({aspect:.2f})"
+                    orientation,
                 )
 
             st.image(
-                image_cv,
-                caption="Preview Foto Asli (Orientasi EXIF Normal)",
-                use_container_width=True
+                image_rgb,
+                caption="Preview Foto Asli",
+                use_container_width=True,
             )
 
     else:
 
         st.info(
-            "📷 **Belum ada foto yang dipilih.** Silakan unggah foto utama yang ingin diberi watermark timestamp."
+            "📷 Upload foto yang masih memiliki timestamp GPS Camera."
         )
 
 
-# ------------------------------------------------------------
-# 2. MASUKKAN TIMESTAMP
-# ------------------------------------------------------------
+# ============================================================
+# STEP 2 - REMOVE
+# ============================================================
 
-st.markdown("### 2️⃣ Masukkan Teks Timestamp")
+st.markdown("### 2️⃣ AI Detect & Remove")
+
+photo_ready = image_rgb is not None
+api_ready = bool(gemini_api_key)
 
 with st.container(border=True):
 
-    tab_manual, tab_ocr = st.tabs(
-        [
-            "✍️ Ketik Manual",
-            "🔍 OCR Screenshot (Gemini AI)"
-        ]
+    st.markdown(
+        """
+        <div class="info-card">
+        🤖 Gemini AI akan mencari <b>lokasi timestamp</b>, bukan membaca
+        isi timestamp. Setelah itu OpenCV membuat <b>pixel mask</b>
+        dan mengisi kembali area tersebut menggunakan <b>inpainting</b>.
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    with tab_manual:
-
-        st.caption(
-            "💡 Masukkan tepat **3 baris**: baris 1 untuk koordinat, "
-            "baris 2 untuk nama lokasi, dan baris 3 untuk tanggal & jam. "
-            "Baris yang kepanjangan akan otomatis dikecilkan ukuran fontnya "
-            "supaya tidak kepotong (lihat detail setelah Generate)."
-        )
-
-    with tab_ocr:
-
-        gemini_api_key = st.secrets.get(
-            "GEMINI_API_KEY",
-            ""
-        )
-
-        if not gemini_api_key:
-
-            st.warning(
-                "⚠️ **`GEMINI_API_KEY` belum dikonfigurasi di Streamlit Secrets.** "
-                "Fitur OCR otomatis membutuhkan API key di pengaturan Secrets."
-            )
-        else:
-
-            st.caption(
-                "✨ **Gemini OCR Siap.** Screenshot area timestamp (Win+Shift+S / Cmd+Shift+4), "
-                "lalu paste di bawah atau unggah filenya."
-            )
-
-        col_paste_btn, col_upload_ocr = st.columns([1, 1])
-
-        with col_paste_btn:
-
-            paste_result = pbutton(
-                label="📋 Klik lalu Tekan Ctrl+V (Paste)",
-                key=f"screenshot_paste_{uploader_version}"
-            )
-
-        with col_upload_ocr:
-
-            screenshot_file = st.file_uploader(
-                "Atau upload screenshot",
-                type=["jpg", "jpeg", "png"],
-                key=f"screenshot_uploader_{uploader_version}",
-                label_visibility="collapsed"
-            )
-
-        screenshot_image = None
-
-        if paste_result.image_data is not None:
-
-            try:
-
-                screenshot_image = ImageOps.exif_transpose(
-                    paste_result.image_data
-                ).convert("RGB")
-
-            except Exception as error:
-
-                st.error(
-                    f"❌ Screenshot hasil paste tidak dapat dibaca: {error}"
-                )
-
-                screenshot_image = None
-
-        elif screenshot_file is not None:
-
-            try:
-
-                screenshot_image = load_pil_image_fixed_orientation(
-                    screenshot_file
-                )
-
-            except Exception as error:
-
-                st.error(
-                    f"❌ Screenshot tidak dapat dibaca: {error}"
-                )
-
-                screenshot_image = None
-
-        if screenshot_image is not None:
-
-            st.image(
-                screenshot_image,
-                caption="Preview Screenshot untuk OCR",
-                use_container_width=True
-            )
-
-            # ----------------------------------------------------
-            # Jalankan OCR OTOMATIS begitu ada screenshot baru
-            # ----------------------------------------------------
-
-            image_buffer_for_hash = io.BytesIO()
-
-            screenshot_image.save(
-                image_buffer_for_hash,
-                format="PNG"
-            )
-
-            screenshot_signature = hashlib.md5(
-                image_buffer_for_hash.getvalue()
-            ).hexdigest()
-
-            already_processed = (
-                st.session_state.last_ocr_signature == screenshot_signature
-            )
-
-            col_ocr_status, col_ocr_button = st.columns([3, 1])
-
-            with col_ocr_button:
-
-                rerun_ocr_clicked = st.button(
-                    "🔁 OCR Ulang",
-                    type="secondary",
-                    disabled=not gemini_api_key,
-                    use_container_width=True
-                )
-
-            should_run_ocr = (
-                gemini_api_key
-                and (not already_processed or rerun_ocr_clicked)
-            )
-
-            if should_run_ocr:
-
-                try:
-
-                    with col_ocr_status:
-
-                        with st.spinner("⏳ Meminta Gemini membaca teks timestamp..."):
-
-                            ocr_result = ocr_extract_text_gemini(
-                                screenshot_image,
-                                gemini_api_key
-                            )
-
-                    st.session_state.last_ocr_signature = screenshot_signature
-
-                    if ocr_result:
-
-                        st.session_state[timestamp_key] = ocr_result
-
-                        st.success(
-                            "✅ OCR Berhasil! Teks sudah dimasukkan ke kotak di bawah."
-                        )
-
-                        st.rerun()
-
-                    else:
-
-                        st.warning("⚠️ Gemini tidak mengembalikan teks apapun.")
-
-                except Exception as error:
-
-                    st.error(f"❌ ERROR OCR GEMINI: {error}")
-
-            elif already_processed:
-
-                st.caption("✅ Screenshot ini sudah berhasil di-OCR.")
-
-    # --------------------------------------------------------
-    # KOTAK INPUT TEXT TIMESTAMP DENGAN LIVE VALIDATOR
-    # --------------------------------------------------------
-
-    st.markdown("---")
-
-    timestamp_text = st.text_area(
-        "Isi Teks Timestamp (Wajib 3 Baris)",
-        height=130,
-        placeholder=(
-            "-5.7297568, 105.6231008\n"
-            "Sukaratu, Lampung Selatan, Lampung\n"
-            "18/8/2026 10:12:35 WIB"
-        ),
-        key=timestamp_key,
-        help="Baris 1: Koordinat | Baris 2: Nama Tempat | Baris 3: Tanggal, Jam & Zona Waktu"
-    )
-
-    # Validasi visual baris input
-    raw_lines = [line.strip() for line in timestamp_text.splitlines() if line.strip()]
-    
-    if len(raw_lines) == 3:
-        st.caption("🟢 **Format valid**: Terdeteksi 3 baris lengkap siap digenerate.")
-    elif len(raw_lines) > 0:
-        st.caption(f"🟡 **Format belum pas**: Terdeteksi {len(raw_lines)} baris. Dibutuhkan tepat 3 baris teks.")
-
-
-# ------------------------------------------------------------
-# 3. GENERATE ACTION
-# ------------------------------------------------------------
-
-st.markdown("### 3️⃣ Generate Watermark")
-
-photo_ready = image_cv is not None
-timestamp_ready = bool(timestamp_text.strip())
-
-with st.container(border=True):
-
-    if not photo_ready or not timestamp_ready:
-
-        missing = []
-
-        if not photo_ready:
-            missing.append("Upload Foto Utama (Langkah 1)")
-
-        if not timestamp_ready:
-            missing.append("Teks Timestamp (Langkah 2)")
-
-        st.info("⏳ **Menunggu input**: Lengkapi " + " & ".join(missing) + " untuk mengaktifkan tombol.")
-
-    generate_clicked = st.button(
-        "🚀 GENERATE TIMESTAMP SEKARANG",
+    remove_clicked = st.button(
+        "🧹 DETECT & REMOVE TIMESTAMP",
         type="primary",
-        disabled=not (photo_ready and timestamp_ready),
-        use_container_width=True
+        disabled=not (photo_ready and api_ready),
+        use_container_width=True,
     )
 
-    if generate_clicked:
+    if remove_clicked:
 
         try:
 
-            with st.spinner("🖌️ Sedang merender font Hershey Simplex & menggambar timestamp..."):
+            image_hash = hashlib.md5(
+                image_rgb.tobytes()
+            ).hexdigest()
 
-                pil_image, info = generate_timestamp_image(
-                    image_cv,
-                    timestamp_text
+            # ------------------------------------------------
+            # AI DETECTION
+            # ------------------------------------------------
+
+            with st.spinner(
+                "🤖 Gemini sedang mencari lokasi timestamp..."
+            ):
+
+                detection = detect_timestamp_region(
+                    photo_pil,
+                    gemini_api_key,
                 )
 
-            # ----------------------------------------------------
-            # SIAPKAN FILE UNTUK DOWNLOAD
-            # ----------------------------------------------------
+            if not detection["found"]:
 
-            name, ext = os.path.splitext(
-                photo_file.name
-            )
-
-            if not ext:
-
-                ext = ".jpg"
-
-            random_word = (
-                secrets.choice(RANDOM_WORD_LIST_A) +
-                secrets.choice(RANDOM_WORD_LIST_B)
-            )
-
-            output_file_name = (
-                name +
-                "_" +
-                random_word +
-                ext
-            )
-
-            result_rgb = np.array(
-                pil_image
-            )
-
-            result_cv = cv2.cvtColor(
-                result_rgb,
-                cv2.COLOR_RGB2BGR
-            )
-
-            if ext.lower() in [
-                ".jpg",
-                ".jpeg"
-            ]:
-
-                encode_success, encoded_bytes = cv2.imencode(
-                    ext,
-                    result_cv,
-                    [
-                        cv2.IMWRITE_JPEG_QUALITY,
-                        95
-                    ]
+                st.error(
+                    "❌ Gemini tidak menemukan timestamp GPS Camera "
+                    "pada foto ini."
                 )
 
-                mime_type = "image/jpeg"
+                st.session_state.last_detection_signature = image_hash
 
             else:
 
-                encode_success, encoded_bytes = cv2.imencode(
-                    ext,
-                    result_cv
+                width = image_rgb.shape[1]
+                height = image_rgb.shape[0]
+
+                box = normalized_box_to_pixels(
+                    detection["box_norm"],
+                    width,
+                    height,
                 )
 
-                mime_type = "image/png"
+                x1, y1, x2, y2 = box
 
-            if encode_success:
+                if not validate_box(
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    width,
+                    height,
+                ):
+                    raise ValueError(
+                        "Bounding box dari AI tidak valid."
+                    )
 
-                st.session_state.generated_result = {
-                    "pil_image": pil_image,
-                    "info": info,
-                    "output_file_name": output_file_name,
-                    "encoded_bytes": encoded_bytes.tobytes(),
+                # --------------------------------------------
+                # PIXEL MASK
+                # --------------------------------------------
+
+                with st.spinner(
+                    "🎯 Menganalisis pixel timestamp..."
+                ):
+
+                    image_bgr = cv2.cvtColor(
+                        image_rgb,
+                        cv2.COLOR_RGB2BGR,
+                    )
+
+                    mask, mask_info = create_timestamp_pixel_mask(
+                        image_bgr,
+                        box,
+                    )
+
+                mask_pixels = mask_info["mask_pixels"]
+
+                if mask_pixels <= 0:
+
+                    raise ValueError(
+                        "Timestamp terdeteksi oleh AI, "
+                        "tetapi pixel mask tidak menemukan pixel timestamp."
+                    )
+
+                # --------------------------------------------
+                # INPAINT
+                # --------------------------------------------
+
+                with st.spinner(
+                    "🧹 Menghapus timestamp & memperbaiki background..."
+                ):
+
+                    result_rgb = remove_timestamp_with_inpainting(
+                        image_rgb,
+                        mask,
+                    )
+
+                (
+                    output_name,
+                    encoded_bytes,
+                    mime_type,
+                ) = encode_image(
+                    result_rgb,
+                    photo_file.name,
+                )
+
+                mask_preview = create_mask_preview(
+                    image_rgb,
+                    mask,
+                )
+
+                st.session_state.remove_result = {
+                    "original": image_rgb,
+                    "result": result_rgb,
+                    "mask_preview": mask_preview,
+                    "mask": mask,
+                    "detection": detection,
+                    "box": box,
+                    "mask_info": mask_info,
+                    "output_name": output_name,
+                    "encoded_bytes": encoded_bytes,
                     "mime_type": mime_type,
                 }
 
+                st.session_state.last_detection_signature = image_hash
+
                 st.rerun()
-
-            else:
-
-                st.error("❌ Gagal encode gambar hasil.")
 
         except Exception as error:
 
-            st.error(f"❌ Terjadi kesalahan: {error}")
+            st.error(
+                f"❌ Terjadi kesalahan saat remove timestamp: {error}"
+            )
 
 
-# ------------------------------------------------------------
-# 4. HASIL (PERSIST DI SESSION STATE)
-# ------------------------------------------------------------
+# ============================================================
+# STEP 3 - RESULT
+# ============================================================
 
-result = st.session_state.generated_result
+result = st.session_state.remove_result
 
 if result is not None:
 
     st.markdown("---")
-    st.markdown("### ✨ Foto Hasil Timestamp")
+
+    st.markdown("### 3️⃣ Hasil")
 
     with st.container(border=True):
 
-        st.success("🎉 **Timestamp Berhasil Digambar!** Foto siap diunduh dengan kualitas tinggi.")
-
-        if result["info"].get("auto_fit_applied"):
-
-            st.info(
-                "📏 **Auto-fit aktif**: salah satu baris teksnya cukup panjang, "
-                "jadi ukuran font otomatis dikecilkan sedikit supaya semua teks "
-                "tetap muat & tidak kepotong."
-            )
-
-        st.image(
-            result["pil_image"],
-            caption=f"Preview Hasil: {result['output_file_name']}",
-            use_container_width=True
+        st.success(
+            "🎉 **Timestamp berhasil diproses!** "
+            "Periksa hasil sebelum download."
         )
 
-        with st.expander("📊 Detail Teks & Parameter Rendering", expanded=True):
+        confidence = result["detection"]["confidence"]
 
-            info = result["info"]
+        box = result["box"]
 
-            st.markdown(
-                f"""
-                <div class="info-card">
-                    📍 <b>Koordinat:</b> <code>{info['line1']}</code><br>
-                    🏢 <b>Lokasi:</b> <code>{info['line2']}</code><br>
-                    ⏰ <b>Waktu:</b> <code>{info['line3']}</code>
-                </div>
-                """,
-                unsafe_allow_html=True
+        mask_info = result["mask_info"]
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric(
+                "🤖 AI Confidence",
+                f"{confidence * 100:.1f}%",
             )
 
-            m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+        with col2:
+            st.metric(
+                "🎯 Mask Pixels",
+                f"{mask_info['mask_pixels']:,}",
+            )
 
-            with m_col1:
-                st.metric("Font Size", f"{info['font_size']} px")
-            with m_col2:
-                st.metric("Outline Width", f"{info['outline_width']} px")
-            with m_col3:
-                st.metric("Margin Kiri", f"{info['left_margin']} px")
-            with m_col4:
-                st.metric("Margin Bawah", f"{info['bottom_margin']} px")
+        with col3:
+            st.metric(
+                "📦 Mask Ratio",
+                f"{mask_info['mask_ratio'] * 100:.2f}%",
+            )
+
+        st.markdown(
+            f"""
+            <div class="info-card">
+            <b>AI Detection Box</b><br>
+            X1: {box[0]} &nbsp;|&nbsp;
+            Y1: {box[1]} &nbsp;|&nbsp;
+            X2: {box[2]} &nbsp;|&nbsp;
+            Y2: {box[3]}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # ----------------------------------------------------
+        # BEFORE / MASK / RESULT
+        # ----------------------------------------------------
+
+        tab_before, tab_mask, tab_result = st.tabs(
+            [
+                "📷 Original",
+                "🎯 Pixel Mask",
+                "✨ Hasil Remove",
+            ]
+        )
+
+        with tab_before:
+
+            st.image(
+                result["original"],
+                caption="Foto Original",
+                use_container_width=True,
+            )
+
+        with tab_mask:
+
+            st.image(
+                result["mask_preview"],
+                caption="Area Pixel yang Akan Dihapus",
+                use_container_width=True,
+            )
 
             st.caption(
-                f"• Font: AVHershey Simplex Medium | Scale Ratio: {info['scale_ratio']:.4f} | "
-                f"Line Spacing: {info['line_spacing']}px | Letter Spacing: {info['letter_spacing']:.2f}px | "
-                f"Auto-fit: {'Ya' if info['auto_fit_applied'] else 'Tidak perlu'}"
+                "Area merah adalah pixel yang masuk ke proses inpainting."
             )
+
+        with tab_result:
+
+            st.image(
+                result["result"],
+                caption="Foto Setelah Timestamp Dihapus",
+                use_container_width=True,
+            )
+
+        # ----------------------------------------------------
+        # DOWNLOAD / RESET
+        # ----------------------------------------------------
 
         col_download, col_reset = st.columns([2, 1])
 
         with col_download:
 
             st.download_button(
-                label=f"⬇️ DOWNLOAD FOTO ({result['output_file_name']})",
+                label=f"⬇️ DOWNLOAD HASIL ({result['output_name']})",
                 data=result["encoded_bytes"],
-                file_name=result["output_file_name"],
+                file_name=result["output_name"],
                 mime=result["mime_type"],
                 type="primary",
-                use_container_width=True
+                use_container_width=True,
             )
 
         with col_reset:
 
             if st.button(
-                "🔄 Reset & Buat Baru",
+                "🔄 Foto Baru",
                 type="secondary",
-                use_container_width=True
+                use_container_width=True,
             ):
 
                 reset_app()
                 st.rerun()
 
 
-# ------------------------------------------------------------
-# FOOTER & CREDITS
-# ------------------------------------------------------------
+# ============================================================
+# FOOTER
+# ============================================================
 
 st.markdown("---")
 
 st.markdown(
     """
     <div class="footer-text">
-        Dibuat oleh <b>Matthew Artur Panahatan Sitorus</b> & <b>Nikita Adriella Virginia Jacob</b><br>
-        <span style="font-size:0.75rem; opacity:0.8;">AVHershey Simplex Medium • Gemini AI Vision OCR • OpenCV Engine</span>
+        <b>Timestamp Remover V8.0</b><br>
+        Gemini Vision • OpenCV Pixel Mask • Inpainting
     </div>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
