@@ -1,5 +1,5 @@
 # ============================================================
-# TIMESTAMP REMOVER - STREAMLIT UI (BATCH + ZIP)
+# TIMESTAMP REMOVER - STREAMLIT UI (BATCH + ZIP) - SMOOTH v2
 # ============================================================
 #
 # Kebalikan dari "Timestamp Generator": app ini MENGHAPUS
@@ -17,9 +17,54 @@
 #      inilah yang membedakan teks dari area putih polos biasa
 #      (lantai keramik putih, tembok putih, baju putih, dll)
 #      yang TIDAK dekat dengan outline tajam serapat itu.
-#   3. Mask hasil deteksi di-dilate & di-inpaint (cv2.inpaint)
-#      supaya area bekas teks direkonstruksi otomatis mengikuti
-#      pola sekitarnya (lantai, tembok, dsb).
+#   3. Mask hasil deteksi di-dilate & direkonstruksi.
+#
+# ============================================================
+# APA YANG BERUBAH DI v2 (SUPAYA LEBIH SMOOTH)
+# ============================================================
+#
+# Versi lama memanggil cv2.inpaint() SATU KALI, langsung di
+# resolusi penuh. cv2.inpaint (TELEA/NS) itu algoritma KLASIK,
+# bukan AI generatif -- dia cuma "menjalarkan" warna dari tepi
+# mask ke dalam berdasarkan tetangga terdekat. Untuk background
+# bertekstur berulang (garis keramik, garis casing TV, paving)
+# hasilnya sering blur / bergaris tidak nyambung, dan di tepi
+# mask suka kelihatan "jahitan" (seam) karena transisinya tajam.
+#
+# Perbaikan yang diterapkan di v2 (tetap tanpa AI/API key,
+# karena sandbox ini tidak ada akses internet untuk download
+# model AI inpainting seperti LaMa / Stable Diffusion):
+#
+#   A. MULTI-SCALE INPAINTING
+#      Inpaint dulu di resolusi kecil (25%, 50%) -> dapat pola
+#      besar yang lebih koheren (garis keramik jadi lebih nyambung
+#      karena "dilihat" dari jauh, bukan piksel-per-piksel).
+#      Hasil itu di-upscale, lalu di resolusi penuh dilakukan
+#      inpaint sekali lagi untuk menambah detail halus.
+#
+#   B. FEATHERED BLENDING (alpha blending lembut di tepi mask)
+#      Setiap hasil inpaint dari tiap skala digabung ke gambar
+#      pakai mask yang di-Gaussian-blur (jadi alpha 0..1 lembut),
+#      bukan mask keras 0/1. Ini menghilangkan "garis potong"
+#      di tepi area yang direkonstruksi.
+#
+#   C. KOMBINASI METODE
+#      Pass resolusi kecil pakai INPAINT_NS (lebih smooth, bagus
+#      untuk area luas/gradasi warna). Pass resolusi penuh pakai
+#      INPAINT_TELEA (lebih tajam, bagus untuk detail/tekstur).
+#
+# Mode ini bisa dimatikan di sidebar ("Mode Halus") kalau mau
+# balik ke inpaint satu-pass yang lebih cepat.
+#
+# CATATAN JUJUR:
+#   Ini TETAP bukan AI generatif yang "paham" isi gambar seperti
+#   LaMa/Stable-Diffusion inpainting. Untuk pola sangat kompleks
+#   (misal motif lantai unik, wajah, objek 3D di area yang
+#   ketiban teks), hasil klasik seperti ini punya batas. Kalau
+#   butuh kualitas setara AI generatif, jalankan model open-source
+#   seperti LaMa (https://github.com/advimman/lama) atau pipeline
+#   Stable Diffusion inpainting di environment yang ada GPU +
+#   akses internet untuk download weights-nya.
 #
 # BATCH:
 #   - Bisa upload banyak foto sekaligus, ATAU upload 1 file .zip
@@ -27,14 +72,6 @@
 #   - Semua foto diproses dengan parameter yang sama (bisa
 #     diatur di sidebar), lalu bisa didownload satu-satu atau
 #     sekaligus dalam .zip.
-#
-# CATATAN:
-#   - Ini bukan "AI OCR", jadi tidak "membaca" teksnya -- murni
-#     mendeteksi pola visual (putih + outline tajam) di pita
-#     bawah foto. Kalau ada elemen lain di pita bawah yang juga
-#     putih terang & bertekstur tajam (misal renda putih, teks
-#     lain), itu bisa ikut kehapus -- makanya parameter di
-#     sidebar bisa diatur & ada preview mask sebelum download.
 # ============================================================
 
 
@@ -71,6 +108,10 @@ DEFAULT_INPAINT_RADIUS = 5
 
 MIN_BLOB_AREA = 15            # buang noda mask yang terlalu kecil
 
+DEFAULT_SMOOTH_MODE = True
+DEFAULT_SMOOTH_SCALES = (0.25, 0.5, 1.0)   # dari kasar -> halus
+DEFAULT_FEATHER_PX = 3        # kelembutan tepi (gaussian sigma, px)
+
 
 # ============================================================
 # ============================================================
@@ -91,11 +132,11 @@ def load_pil_image_fixed_orientation(file_bytes):
 
 # ============================================================
 # ============================================================
-# DETEKSI + HAPUS TIMESTAMP
+# DETEKSI TIMESTAMP -> MASK
 # ============================================================
 # ============================================================
 
-def remove_timestamp(
+def detect_timestamp_mask(
     image_bgr,
     top_pct=DEFAULT_TOP_PCT,
     left_pct=DEFAULT_LEFT_PCT,
@@ -104,7 +145,6 @@ def remove_timestamp(
     white_thresh=DEFAULT_WHITE_THRESH,
     edge_thresh=DEFAULT_EDGE_THRESH,
     dilate_px=DEFAULT_DILATE_PX,
-    inpaint_radius=DEFAULT_INPAINT_RADIUS,
 ):
 
     height, width = image_bgr.shape[:2]
@@ -190,13 +230,144 @@ def remove_timestamp(
 
     full_mask[top:bottom, left:right] = clean_mask
 
-    detected_px = int(np.count_nonzero(full_mask))
+    return full_mask
 
-    inpainted = cv2.inpaint(
-        image_bgr, full_mask, inpaint_radius, cv2.INPAINT_TELEA
+
+# ============================================================
+# ============================================================
+# REKONSTRUKSI - MODE CEPAT (1 pass, seperti versi lama)
+# ============================================================
+# ============================================================
+
+def reconstruct_fast(image_bgr, mask, inpaint_radius=DEFAULT_INPAINT_RADIUS):
+
+    return cv2.inpaint(image_bgr, mask, inpaint_radius, cv2.INPAINT_TELEA)
+
+
+# ============================================================
+# ============================================================
+# REKONSTRUKSI - MODE HALUS (multi-scale + feathered blending)
+# ============================================================
+# ============================================================
+#
+# Ide: dari resolusi paling kasar ke paling halus, tiap tahap
+# melakukan inpaint lalu di-blend balik ke gambar hasil tahap
+# sebelumnya pakai alpha yang lembut (mask di-Gaussian-blur).
+# Tahap kasar menyumbang struktur/pola besar yang koheren,
+# tahap halus menyumbang detail, dan feathering menghilangkan
+# garis potong tajam di tepi area yang direkonstruksi.
+# ============================================================
+
+def reconstruct_smooth(
+    image_bgr,
+    mask,
+    inpaint_radius=DEFAULT_INPAINT_RADIUS,
+    scales=DEFAULT_SMOOTH_SCALES,
+    feather_px=DEFAULT_FEATHER_PX,
+):
+
+    height, width = image_bgr.shape[:2]
+
+    result = image_bgr.copy()
+
+    for scale in scales:
+
+        small_w = max(1, int(width * scale))
+        small_h = max(1, int(height * scale))
+
+        img_small = cv2.resize(
+            result, (small_w, small_h), interpolation=cv2.INTER_AREA
+        )
+
+        mask_small = cv2.resize(
+            mask, (small_w, small_h), interpolation=cv2.INTER_NEAREST
+        )
+
+        _, mask_small = cv2.threshold(
+            mask_small, 127, 255, cv2.THRESH_BINARY
+        )
+
+        if not np.any(mask_small):
+            continue
+
+        # skala kasar -> INPAINT_NS (lebih smooth untuk area luas)
+        # skala penuh -> INPAINT_TELEA (lebih tajam untuk detail)
+        method = cv2.INPAINT_NS if scale < 1.0 else cv2.INPAINT_TELEA
+
+        inpainted_small = cv2.inpaint(
+            img_small, mask_small, inpaint_radius, method
+        )
+
+        inpainted_up = cv2.resize(
+            inpainted_small, (width, height), interpolation=cv2.INTER_CUBIC
+        )
+
+        # alpha lembut = mask asli (resolusi penuh) di-blur Gaussian
+        alpha = mask.astype(np.float32) / 255.0
+        alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=feather_px)
+        alpha = np.clip(alpha, 0.0, 1.0)[..., None]
+
+        result = (
+            inpainted_up.astype(np.float32) * alpha
+            + result.astype(np.float32) * (1.0 - alpha)
+        ).astype(np.uint8)
+
+    return result
+
+
+# ============================================================
+# ============================================================
+# FUNGSI UTAMA: DETEKSI + HAPUS TIMESTAMP
+# ============================================================
+# ============================================================
+
+def remove_timestamp(
+    image_bgr,
+    top_pct=DEFAULT_TOP_PCT,
+    left_pct=DEFAULT_LEFT_PCT,
+    right_pct=DEFAULT_RIGHT_PCT,
+    bottom_pct=DEFAULT_BOTTOM_PCT,
+    white_thresh=DEFAULT_WHITE_THRESH,
+    edge_thresh=DEFAULT_EDGE_THRESH,
+    dilate_px=DEFAULT_DILATE_PX,
+    inpaint_radius=DEFAULT_INPAINT_RADIUS,
+    smooth_mode=DEFAULT_SMOOTH_MODE,
+    feather_px=DEFAULT_FEATHER_PX,
+):
+
+    full_mask = detect_timestamp_mask(
+        image_bgr,
+        top_pct=top_pct,
+        left_pct=left_pct,
+        right_pct=right_pct,
+        bottom_pct=bottom_pct,
+        white_thresh=white_thresh,
+        edge_thresh=edge_thresh,
+        dilate_px=dilate_px,
     )
 
-    return inpainted, full_mask, detected_px
+    detected_px = int(np.count_nonzero(full_mask))
+
+    if detected_px == 0:
+
+        return image_bgr.copy(), full_mask, detected_px
+
+    if smooth_mode:
+
+        reconstructed = reconstruct_smooth(
+            image_bgr,
+            full_mask,
+            inpaint_radius=inpaint_radius,
+            feather_px=feather_px,
+        )
+
+    else:
+
+        reconstructed = reconstruct_fast(
+            image_bgr, full_mask, inpaint_radius=inpaint_radius
+        )
+
+    return reconstructed, full_mask, detected_px
 
 
 # ============================================================
@@ -351,6 +522,31 @@ with st.sidebar:
         step=1,
     )
 
+    st.markdown("### ✨ Kehalusan Hasil")
+
+    smooth_mode = st.checkbox(
+        "Mode Halus (multi-scale + feathered blending)",
+        value=DEFAULT_SMOOTH_MODE,
+        help="Rekonstruksi dilakukan berlapis dari resolusi kecil ke "
+        "besar, lalu digabung dengan transisi lembut di tepi. Hasil "
+        "jauh lebih smooth, tapi sedikit lebih lambat diproses. "
+        "Matikan untuk kembali ke mode cepat (1 pass).",
+    )
+
+    feather_px = DEFAULT_FEATHER_PX
+
+    if smooth_mode:
+
+        feather_px = st.slider(
+            "Kelembutan tepi (feather, px)",
+            min_value=0,
+            max_value=10,
+            value=DEFAULT_FEATHER_PX,
+            step=1,
+            help="Makin besar, transisi antara area rekonstruksi dan "
+            "area asli makin lembut (mengurangi garis 'jahitan').",
+        )
+
     show_mask_preview = st.checkbox(
         "Tampilkan preview area yang terdeteksi (mask)",
         value=True,
@@ -424,6 +620,8 @@ if process_clicked:
                 edge_thresh=edge_thresh,
                 dilate_px=dilate_px,
                 inpaint_radius=inpaint_radius,
+                smooth_mode=smooth_mode,
+                feather_px=feather_px,
             )
 
             name, ext = os.path.splitext(filename)
@@ -552,6 +750,8 @@ st.markdown("---")
 
 st.caption(
     "Deteksi berbasis pola piksel (putih terang + outline tajam) di "
-    "pita bawah foto -- tanpa AI/API key. Kalau hasil kurang pas, "
-    "atur parameter di sidebar lalu proses ulang."
+    "pita bawah foto -- tanpa AI/API key. Mode Halus memakai "
+    "multi-scale inpainting + feathered blending supaya transisi "
+    "lebih smooth. Kalau hasil kurang pas, atur parameter di "
+    "sidebar lalu proses ulang."
 )
