@@ -1,8 +1,10 @@
 streamlit>=1.48,<2
 easyocr==1.7.2
-opencv-python-headless>=4.10
-Pillow>=10.4
-numpy>=1.26,<3
-torch
-torchvision
+numpy==1.26.4
+Pillow==9.5.0
+scikit-image==0.22.0
+opencv-python==4.10.0.84
+opencv-python-headless==4.10.0.84
+torch==2.5.1
+torchvision==0.20.1
 simple-lama-inpainting==0.1.2
